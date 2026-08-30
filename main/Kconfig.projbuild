@@ -1,0 +1,148 @@
+menu "AVA Voice / Louder ESP32 Rev H6"
+
+    config HEADSET_NAME
+        string "Bluetooth headset name"
+        default "Rockerz 258 Pro+"
+        help
+            Bluetooth headset name to search and connect automatically.
+
+    menu "Louder ESP32 Rev H6 audio hardware"
+
+        config I2S_BCLK_GPIO
+            int "I2S BCLK/SCK GPIO"
+            default 26
+            help
+                Louder ESP32 Rev H6 TAS5805M BCLK is GPIO26.
+
+        config I2S_LRCLK_GPIO
+            int "I2S LRCLK/WS GPIO"
+            default 25
+            help
+                Louder ESP32 Rev H6 TAS5805M WS/LRCLK is GPIO25.
+
+        config I2S_DOUT_GPIO
+            int "I2S DOUT GPIO"
+            default 22
+            help
+                Louder ESP32 Rev H6 TAS5805M SDIN is GPIO22.
+
+        config LOUDER_TAS5805M_SDA_GPIO
+            int "TAS5805M I2C SDA GPIO"
+            default 21
+            help
+                Louder ESP32 Rev H6 fixed board connection: GPIO21.
+
+        config LOUDER_TAS5805M_SCL_GPIO
+            int "TAS5805M I2C SCL GPIO"
+            default 27
+            help
+                Louder ESP32 Rev H6 fixed board connection: GPIO27.
+
+        config LOUDER_TAS5805M_PWDN_GPIO
+            int "TAS5805M PWDN GPIO"
+            default 33
+            help
+                Louder ESP32 Rev H6 fixed board connection: GPIO33.
+
+        config LOUDER_TAS5805M_FAULT_GPIO
+            int "TAS5805M FAULT# GPIO"
+            default 34
+            help
+                Louder ESP32 Rev H6 fixed board connection: GPIO34 (input only).
+
+        config LOUDER_TAS5805M_I2C_ADDR
+            int "TAS5805M I2C address (decimal)"
+            range 44 47
+            default 45
+            help
+                TAS5805M address. 45 decimal is 0x2D and is the Louder default.
+
+        config LOUDER_TAS5805M_I2C_FREQ_HZ
+            int "TAS5805M I2C frequency"
+            range 50000 400000
+            default 100000
+
+        config LOUDER_ANALOG_GAIN_STEPS
+            int "TAS5805M analog attenuation steps (0.5 dB each)"
+            range 0 31
+            default 0
+            help
+                0 = 0 dB analog attenuation, 12 = -6 dB, 31 = -15.5 dB.
+                Keep 0 unless you intentionally want to limit maximum output power.
+
+    endmenu
+
+    menu "Potentiometer volume control"
+
+        config VOLUME_POT_GPIO
+            int "Potentiometer ADC GPIO"
+            default 36
+            help
+                Default GPIO36 = ADC1_CH0 on the classic ESP32 and is free on
+                Louder ESP32 Rev H6. Connect potentiometer wiper here.
+
+        config VOLUME_MAX_PERCENT
+            int "Maximum logical volume (%)"
+            range 1 100
+            default 60
+            help
+                Keeps the previous project behavior: full potentiometer travel
+                reaches 60% linear amplitude (about -4.5 dB in the TAS5805M DSP).
+
+        config VOLUME_HYSTERESIS_PERCENT
+            int "Volume hysteresis (%)"
+            range 1 10
+            default 2
+
+        config VOLUME_POLL_INTERVAL_MS
+            int "Potentiometer polling interval (ms)"
+            range 20 1000
+            default 100
+
+    endmenu
+
+    config ENABLE_SD_RECORDING
+        bool "Enable legacy SDMMC audio recording"
+        default n
+        help
+            Disabled by default for Louder ESP32 Rev H6. The old Amped project
+            used the ESP32 default SDMMC pins, which overlap H6 peripherals.
+            Only enable after adapting the SD wiring/pin mapping for your hardware.
+
+    if ENABLE_SD_RECORDING
+
+        config FORMAT_IF_MOUNT_FAILED
+            bool "Format card if mount failed"
+            default n
+
+        choice SDMMC_BUS_WIDTH
+            prompt "SD/MMC bus width"
+            default SDMMC_BUS_WIDTH_1
+
+            config SDMMC_BUS_WIDTH_4
+                bool "4 lines (D0-D3)"
+
+            config SDMMC_BUS_WIDTH_1
+                bool "1 line (D0)"
+        endchoice
+
+    endif
+
+    config ENABLE_HEADSET_RESET_GPIO
+        bool "Enable external GPIO long-press for clearing saved headset"
+        default n
+        help
+            Disabled on H6 by default because GPIO12 belongs to the onboard RGB
+            LED and GPIO39 to the IR receiver. The serial command headset-reset
+            remains available. Enable only if you wire a dedicated external pin.
+
+    if ENABLE_HEADSET_RESET_GPIO
+        config HEADSET_RESET_GPIO
+            int "External headset reset GPIO"
+            default 2
+        config HEADSET_RESET_ACTIVE_HIGH
+            bool "Reset input is active HIGH"
+            default y
+    endif
+
+endmenu
