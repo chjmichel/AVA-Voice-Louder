@@ -6,6 +6,7 @@ idf_component_register(
         "louder_tas5805m.c"
         "main.c"
         "bt_app_hf.c"
+        "audio_mixer.c"
         "notification_sound.c"
         "bt_device_memory.c"
     INCLUDE_DIRS "."

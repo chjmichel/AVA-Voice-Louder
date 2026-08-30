@@ -2,6 +2,7 @@
 #include "volume_control.h"
 #include "louder_tas5805m.h"
 #include "notification_sound.h"
+#include "audio_mixer.h"
 #include "bt_device_memory.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -57,8 +58,30 @@ static TickType_t last_codec_negotiation_time = 0;
 #define MAX_CODEC_NEGOTIATIONS 20  // Stop after 20 attempts
 #define CODEC_NEGOTIATION_TIMEOUT_MS 10000  // Reset counter after 10 seconds
 
-// Last negotiated WBS mode (ESP_HF_WBS_NONE/NO/YES)
+// Last negotiated HFP codec (ESP_HF_WBS_NONE/NO/YES).
+// mSBC/WBS is preferred for best HFP speech quality; CVSD remains the
+// standards-compliant fallback when the headset cannot negotiate WBS.
 static esp_hf_wbs_config_t negotiated_mode = ESP_HF_WBS_NONE;
+#define HFP_CVSD_SAMPLE_RATE 8000U
+#define HFP_MSBC_SAMPLE_RATE 16000U
+static volatile uint32_t hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+
+// Play the AVA brand jingle once per full HFP/SLC connection.
+// A SCO retry within the same SLC session must not replay the brand song.
+static bool connection_jingle_pending = false;
+
+static const char *bt_app_hfp_codec_name(esp_hf_wbs_config_t mode)
+{
+    switch (mode) {
+    case ESP_HF_WBS_YES:
+        return "mSBC/WBS";
+    case ESP_HF_WBS_NO:
+        return "CVSD";
+    case ESP_HF_WBS_NONE:
+    default:
+        return "not negotiated";
+    }
+}
 
 // Track if audio connection was requested for current codec
 static bool audio_connect_requested = false;
@@ -256,8 +279,10 @@ static void bt_app_mgr_task(void *arg)
             if (is_connected && !audio_connect_requested) {
                 esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALL, 1);
                 esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALLSETUP, 0);
-                negotiated_mode = ESP_HF_WBS_NO;
-                ESP_LOGI(TAG, "Call active; requesting CVSD audio");
+                // Do not force a codec here. With CONFIG_BT_HFP_WBS_ENABLE=y,
+                // Bluedroid negotiates mSBC when the peer supports it and
+                // automatically falls back to CVSD otherwise.
+                ESP_LOGI(TAG, "Call active; requesting HFP audio (mSBC preferred, CVSD fallback)");
                 audio_retry_count = 1;
                 audio_connect_requested = true;
                 esp_err_t ret = esp_hf_ag_audio_connect(peer_bd_addr);
@@ -585,7 +610,7 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
 #include "driver/sdmmc_host.h"
 #endif
 
-#define SAMPLE_RATE 44100  // Audio sample rate for Louder H6 / TAS5805M
+#define SAMPLE_RATE 48000  // Fixed high-quality mixer/output rate for Louder H6 / TAS5805M
 #define I2S_PORT I2S_NUM_0 // I2S Peripheral
 #define BUFFER_SIZE 512    // DMA Buffer Size
 
@@ -646,7 +671,7 @@ bool is_30_minutes_passed()
     return (elapsed >= RECORD_DURATION);
 }
 
-void wav_header_init(wav_header_t *header, uint32_t data_size)
+void wav_header_init(wav_header_t *header, uint32_t data_size, uint32_t sample_rate)
 {
     memcpy(header->riff, "RIFF", 4);
     header->chunk_size = data_size + sizeof(wav_header_t) - 8; // File size - 8 bytes
@@ -655,8 +680,8 @@ void wav_header_init(wav_header_t *header, uint32_t data_size)
     header->subchunk1_size = 16;
     header->audio_format = 1;      // PCM Format
     header->num_channels = 1;      // Mono
-    header->sample_rate = 16000;   // mSBC Standard
-    header->byte_rate = 16000 * 2; // 16000 * 16-bit * Mono
+    header->sample_rate = sample_rate;
+    header->byte_rate = sample_rate * 2; // 16-bit mono
     header->block_align = 2;       // 2 bytes/sample
     header->bits_per_sample = 16;  // 16 bits per sample
     memcpy(header->data, "data", 4);
@@ -668,7 +693,7 @@ void finalize_wav_file(FILE *file, uint32_t total_bytes)
     rewind(file); // Go back to the start of the file
 
     wav_header_t wav_header;
-    wav_header_init(&wav_header, total_bytes);
+    wav_header_init(&wav_header, total_bytes, hfp_input_sample_rate);
     fwrite(&wav_header, sizeof(wav_header_t), 1, file);
 
     ESP_LOGI("SDCARD", "WAV Header Updated: %ld bytes", total_bytes);
@@ -705,7 +730,7 @@ void open_new_file()
     }
 
     wav_header_t wav_header;
-    wav_header_init(&wav_header, 0);
+    wav_header_init(&wav_header, 0, hfp_input_sample_rate);
     fwrite(&wav_header, sizeof(wav_header), 1, record_file);
 }
 
@@ -764,10 +789,18 @@ esp_err_t init_sdcard()
 
 #endif /* CONFIG_ENABLE_SD_RECORDING */
 
-// Resample Function (Linear Interpolation) - HFP mono to TAS5805M stereo
-void resample_linear_stereo(const int16_t *input, int input_size, int32_t *output, int *output_size)
+// Resample HFP mono PCM to the fixed 48 kHz TAS5805M stereo master rate.
+// CVSD delivers 8 kHz mono, while mSBC/WBS delivers 16 kHz mono. Keeping
+// the amplifier side fixed at 48 kHz avoids re-clocking the DSP when a future
+// high-quality 48 kHz source is mixed with HFP speech.
+void resample_linear_stereo(const int16_t *input, int input_size, uint32_t input_rate,
+                            int32_t *output, int *output_size)
 {
-    float ratio = 44100.0 / 16000.0; // 2.75625
+    if (input_rate == 0) {
+        input_rate = HFP_CVSD_SAMPLE_RATE;
+    }
+
+    float ratio = (float)SAMPLE_RATE / (float)input_rate;
     int output_samples = (int)(input_size * ratio);
 
     for (int i = 0; i < output_samples; i++)
@@ -807,13 +840,15 @@ void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
     static int32_t resampled_buffer[BUFFER_SIZE * 6]; // Larger buffer for 32-bit stereo
     int output_size;
 
-    resample_linear_stereo(input, input_size, resampled_buffer, &output_size);
+    const uint32_t input_rate = hfp_input_sample_rate;
+    resample_linear_stereo(input, input_size, input_rate, resampled_buffer, &output_size);
 
-    esp_err_t ret;
-    ret = i2s_channel_write(tx_chan, resampled_buffer, output_size * 4, NULL, portMAX_DELAY);
-    if (ret != ESP_OK)
+    // HFP never writes directly to I2S. The central 48 kHz mixer is the only
+    // I2S writer and combines this speech with the local brand jingle.
+    esp_err_t mix_ret = audio_mixer_submit_hfp(resampled_buffer, (size_t)output_size / 2U);
+    if (mix_ret != ESP_OK && mix_ret != ESP_ERR_TIMEOUT)
     {
-        ESP_LOGE("I2S", "Failed to write to I2S.");
+        ESP_LOGW("AUDIO_MIXER", "Could not queue HFP PCM: %s", esp_err_to_name(mix_ret));
     }
 
     // ESP_LOGI("AUDIO", "Received %d bytes, Resampled to %d bytes", input_size * 2, output_size * 4);
@@ -875,6 +910,13 @@ static esp_err_t bt_app_send_data(void)
 {
     esp_err_t ret;
 
+    // A duplicate CONNECTED event must never create a second writer or prime
+    // I2S while the mixer already owns the channel.
+    if (audio_mixer_is_running() && i2s_enabled && louder_tas5805m_is_ready()) {
+        ESP_LOGD("AUDIO", "Audio mixer already running");
+        return ESP_OK;
+    }
+
     if (!i2s_initialized)
     {
         ESP_LOGI("I2S", "Initializing I2S for Louder H6 TAS5805M (32-bit stereo)...");
@@ -927,7 +969,7 @@ static esp_err_t bt_app_send_data(void)
     static const int32_t silence[128] = {0};
     size_t bytes_written = 0;
     esp_err_t i2s_ret = i2s_channel_write(tx_chan, silence, sizeof(silence),
-                                          &bytes_written, pdMS_TO_TICKS(100));
+                                          &bytes_written, 100U);
     if (i2s_ret != ESP_OK) {
         ESP_LOGW("I2S", "Could not prime TAS5805M clock with silence: %s", esp_err_to_name(i2s_ret));
     }
@@ -941,6 +983,19 @@ static esp_err_t bt_app_send_data(void)
             i2s_enabled = false;
         }
         return amp_ret;
+    }
+
+    // From this point on the mixer task is the ONLY I2S writer. HFP, jingles
+    // and future high-quality sources feed 48 kHz stereo PCM into it.
+    esp_err_t mixer_ret = audio_mixer_start(tx_chan);
+    if (mixer_ret != ESP_OK) {
+        ESP_LOGE("AUDIO", "Audio mixer failed to start: %s", esp_err_to_name(mixer_ret));
+        louder_tas5805m_stop();
+        if (i2s_enabled) {
+            i2s_channel_disable(tx_chan);
+            i2s_enabled = false;
+        }
+        return mixer_ret;
     }
 
 #if CONFIG_ENABLE_SD_RECORDING
@@ -983,6 +1038,15 @@ static esp_err_t bt_app_send_data(void)
 void bt_app_send_data_shut_down(void)
 {
     ESP_LOGI("AUDIO", "Shutting down audio...");
+
+    // Stop local producers first, then stop the central single I2S writer.
+    if (notification_sound_is_playing()) {
+        notification_sound_stop();
+        for (int i = 0; i < 20 && notification_sound_is_playing(); ++i) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    audio_mixer_stop();
 
     // Put the TAS5805M in Hi-Z/PWDN while I2S clocks are still available.
     esp_err_t amp_ret = louder_tas5805m_stop();
@@ -1159,6 +1223,9 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             audio_retry_count = 0;
             audio_connect_requested = false;
             codec_negotiation_count = 0;
+            negotiated_mode = ESP_HF_WBS_NONE;
+            hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+            connection_jingle_pending = true;
 
             // Trigger call setup immediately, finish setup asynchronously.
             esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALLSETUP, 1);
@@ -1184,6 +1251,9 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             is_connecting = false;
             audio_retry_count = 0;
             audio_connect_requested = false;
+            negotiated_mode = ESP_HF_WBS_NONE;
+            hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+            connection_jingle_pending = false;
 
             if (suppress_disconnect_reconnect_once) {
                 suppress_disconnect_reconnect_once = false;
@@ -1207,20 +1277,41 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         
     case ESP_HF_AUDIO_STATE_EVT:
         ESP_LOGI(TAG, "Audio state: %d", param->audio_stat.state);
-        // Check for both CONNECTED (2) and CONNECTED_MSBC (3) states
+        // The audio-state event is authoritative for the active transport.
         if (param->audio_stat.state == ESP_HF_AUDIO_STATE_CONNECTED ||
-            param->audio_stat.state == 3) {  // ESP_HF_AUDIO_STATE_CONNECTED_MSBC
-            ESP_LOGI(TAG, "=== HFP AUDIO CONNECTED ===");
+            param->audio_stat.state == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
+            if (param->audio_stat.state == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
+                negotiated_mode = ESP_HF_WBS_YES;
+                hfp_input_sample_rate = HFP_MSBC_SAMPLE_RATE;
+            } else {
+                negotiated_mode = ESP_HF_WBS_NO;
+                hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+            }
+
+            ESP_LOGI(TAG, "=== HFP AUDIO CONNECTED: %s, %lu Hz mono -> %d Hz stereo ===",
+                     bt_app_hfp_codec_name(negotiated_mode),
+                     (unsigned long)hfp_input_sample_rate, SAMPLE_RATE);
             
 #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
-            ESP_LOGI(TAG, "Microphone audio will now stream to amplifier");
+            ESP_LOGI(TAG, "Microphone audio will now stream to Louder H6");
             
             // Initialize I2S first, then configure the TAS5805M DSP while the
             // I2S clocks are already stable. Do not accept PCM callbacks if the
             // amplifier setup failed.
             esp_err_t audio_init_ret = bt_app_send_data();
             if (audio_init_ret == ESP_OK) {
-                notification_sound_play_connection();
+                // Start the brand song without blocking the Bluetooth callback. The
+                // incoming HFP callback is registered immediately, but suppresses
+                // local microphone playback while the jingle owns I2S.
+                if (connection_jingle_pending) {
+                    esp_err_t jingle_ret = notification_sound_play_connection_async();
+                    if (jingle_ret == ESP_OK) {
+                        connection_jingle_pending = false;
+                    } else {
+                        ESP_LOGW(TAG, "Could not start AVA brand jingle: %s",
+                                 esp_err_to_name(jingle_ret));
+                    }
+                }
 
                 esp_hf_ag_register_data_callback(bt_app_hf_incoming_cb, bt_hf_audio_data_send_cb);
                 ESP_LOGI(TAG, "Audio data callback registered; Louder H6 output ready");
@@ -1260,6 +1351,32 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         }
         break;
         
+    case ESP_HF_WBS_RESPONSE_EVT:
+        // Codec status from the HF peer. This is not necessarily the final
+        // selection, but is useful for diagnosing WBS/eSCO negotiation.
+        ESP_LOGI(TAG, "HFP codec status: %s (%d)",
+                 bt_app_hfp_codec_name(param->wbs_rep.codec),
+                 (int)param->wbs_rep.codec);
+        if (param->wbs_rep.codec == ESP_HF_WBS_YES) {
+            hfp_input_sample_rate = HFP_MSBC_SAMPLE_RATE;
+        } else if (param->wbs_rep.codec == ESP_HF_WBS_NO) {
+            hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+        }
+        break;
+
+    case ESP_HF_BCS_RESPONSE_EVT:
+        // Final codec chosen by HFP codec negotiation. mSBC remains preferred
+        // when both sides support WBS; CVSD is the transparent fallback.
+        negotiated_mode = param->bcs_rep.mode;
+        hfp_input_sample_rate = (negotiated_mode == ESP_HF_WBS_YES)
+                                    ? HFP_MSBC_SAMPLE_RATE
+                                    : HFP_CVSD_SAMPLE_RATE;
+        ESP_LOGI(TAG, "HFP final codec: %s (%d), input sample rate %lu Hz",
+                 bt_app_hfp_codec_name(negotiated_mode),
+                 (int)negotiated_mode,
+                 (unsigned long)hfp_input_sample_rate);
+        break;
+
     case ESP_HF_CIND_RESPONSE_EVT:
         ESP_LOGI(TAG, "CIND (Indicator) response event - sending status");
         // Respond with indicator values: service=1, call=0, callsetup=0, callheld=0, signal=5, roam=0, batt=5

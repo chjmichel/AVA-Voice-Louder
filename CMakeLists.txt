@@ -4,3 +4,10 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(hfp_ag)
+
+# Embed the AVA connection brand song directly into application flash.
+# RENAME_TO gives the C code stable linker symbols independent of the source path.
+target_add_binary_data(${CMAKE_PROJECT_NAME}.elf
+    "${CMAKE_CURRENT_LIST_DIR}/assets/audio/start_jingle.wav"
+    BINARY
+    RENAME_TO start_jingle_wav)
