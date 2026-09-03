@@ -52,12 +52,6 @@ bool is_connecting = false;
 static uint8_t audio_retry_count = 0;
 #define MAX_AUDIO_RETRIES 3
 
-// Codec negotiation tracking to prevent infinite loops
-static uint32_t codec_negotiation_count = 0;
-static TickType_t last_codec_negotiation_time = 0;
-#define MAX_CODEC_NEGOTIATIONS 20  // Stop after 20 attempts
-#define CODEC_NEGOTIATION_TIMEOUT_MS 10000  // Reset counter after 10 seconds
-
 // Last negotiated HFP codec (ESP_HF_WBS_NONE/NO/YES).
 // mSBC/WBS is preferred for best HFP speech quality; CVSD remains the
 // standards-compliant fallback when the headset cannot negotiate WBS.
@@ -820,7 +814,7 @@ void resample_linear_stereo(const int16_t *input, int input_size, uint32_t input
         }
         
         // Convert 16-bit to 32-bit and duplicate for stereo (L+R channels)
-        int32_t sample_32 = ((int32_t)sample) << 16; // Scale to 32-bit
+        int32_t sample_32 = (int32_t)sample * 65536; // Scale to 32-bit without signed-shift UB
         output[i * 2] = sample_32;     // Left channel
         output[i * 2 + 1] = sample_32; // Right channel
     }
@@ -921,6 +915,12 @@ static esp_err_t bt_app_send_data(void)
     {
         ESP_LOGI("I2S", "Initializing I2S for Louder H6 TAS5805M (32-bit stereo)...");
         i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+
+        /* One DMA buffer = one 5 ms mixer block. Multiple descriptors absorb
+         * normal task/BT scheduling jitter without growing application FIFOs. */
+        chan_cfg.dma_frame_num = AUDIO_MIXER_BLOCK_FRAMES;
+        chan_cfg.dma_desc_num = 6;
+
         ret = i2s_new_channel(&chan_cfg, &tx_chan, NULL);
         if (ret != ESP_OK) {
             ESP_LOGE("I2S", "Failed to create I2S TX channel: %s", esp_err_to_name(ret));
@@ -1035,7 +1035,7 @@ static esp_err_t bt_app_send_data(void)
 }
 
 // Stop Recording & Audio Playback
-void bt_app_send_data_shut_down(void)
+static void bt_app_send_data_shut_down(void)
 {
     ESP_LOGI("AUDIO", "Shutting down audio...");
 
@@ -1101,6 +1101,22 @@ void bt_app_send_data_shut_down(void)
 }
 
 #endif /* #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI */
+
+esp_err_t bt_app_audio_engine_start(void)
+{
+#if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
+    return bt_app_send_data();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+void bt_app_audio_engine_stop(void)
+{
+#if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
+    bt_app_send_data_shut_down();
+#endif
+}
 
 const char *c_hf_evt_str[] = {
     "CONNECTION_STATE_EVT", /*!< SERVICE LEVEL CONNECTION STATE CONTROL */
@@ -1222,7 +1238,6 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             esp_bt_gap_cancel_discovery();
             audio_retry_count = 0;
             audio_connect_requested = false;
-            codec_negotiation_count = 0;
             negotiated_mode = ESP_HF_WBS_NONE;
             hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
             connection_jingle_pending = true;
@@ -1244,7 +1259,8 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             trying_saved_mac = false;
 
 #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
-            bt_app_send_data_shut_down();
+            /* HFP is only one mixer source. Keep CM108B/TAS5805M running. */
+            audio_mixer_clear_hfp();
 #endif
 
             is_connected = false;
@@ -1294,7 +1310,10 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             
 #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
             ESP_LOGI(TAG, "Microphone audio will now stream to Louder H6");
+            audio_mixer_clear_hfp();
             
+            // The local audio engine normally starts at boot. Keep this
+            // idempotent call as a recovery path if startup had failed.
             // Initialize I2S first, then configure the TAS5805M DSP while the
             // I2S clocks are already stable. Do not accept PCM callbacks if the
             // amplifier setup failed.
@@ -1333,8 +1352,11 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             ESP_LOGW(TAG, "Audio disconnected (attempt %d/%d)", audio_retry_count, MAX_AUDIO_RETRIES);
             
 #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
-            // Shutdown I2S and SD card recording
-            bt_app_send_data_shut_down();
+            /*
+             * Do NOT stop I2S, TAS5805M or CM108B here. The SCO/HFP transport
+             * is optional; Samsung USB audio must continue independently.
+             */
+            audio_mixer_clear_hfp();
 #endif
             
             // Reset the connect requested flag to allow retry

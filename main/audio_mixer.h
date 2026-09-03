@@ -1,5 +1,5 @@
-#ifndef __AUDIO_MIXER_H__
-#define __AUDIO_MIXER_H__
+#ifndef AVA_AUDIO_MIXER_H
+#define AVA_AUDIO_MIXER_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -14,61 +14,64 @@ extern "C" {
 #endif
 
 #define AUDIO_MIXER_SAMPLE_RATE_HZ 48000U
+#define AUDIO_MIXER_CHANNELS       2U
+#define AUDIO_MIXER_BLOCK_FRAMES   240U  /* 5 ms at 48 kHz */
 
 /**
- * @brief Start the single-writer 48 kHz stereo mixer for the Louder H6.
+ * Start the central 48 kHz stereo mixer.
  *
- * From the moment this succeeds, only the mixer task may write to the I2S TX
- * channel. HFP and local sounds feed PCM into the mixer instead.
+ * tx_chan is the already configured/enabled I2S0 TX channel that drives the
+ * Louder H6 TAS5805M (GPIO26 BCLK, GPIO25 LRCLK, GPIO22 DATA).
+ *
+ * The mixer additionally creates I2S1 RX as a SLAVE for the CM108B:
+ *   GPIO18 <- CM108B DASCLK/BCLK
+ *   GPIO19 <- CM108B DALRCK/LRCLK
+ *   GPIO23 <- CM108B SDOUT/DATA
+ *
+ * The mixer task is the ONLY writer to tx_chan after this function succeeds.
  */
 esp_err_t audio_mixer_start(i2s_chan_handle_t tx_chan);
 
-/**
- * @brief Stop the mixer task and clear all pending source PCM.
- */
+/** Stop mixer and CM108B I2S1 RX. */
 void audio_mixer_stop(void);
 
+/** Returns true while the central mixer is running. */
+bool audio_mixer_is_running(void);
+
 /**
- * @brief Submit already-resampled 48 kHz stereo signed 32-bit HFP PCM.
+ * Queue already-resampled HFP PCM.
  *
- * This call is non-blocking and is safe for the HFP data callback. If the HFP
- * FIFO cannot accept the complete block, the complete block is dropped to
- * avoid ever-growing live-monitor latency.
+ * Format: 48 kHz, stereo, signed 32-bit I2S samples, one frame = L + R.
+ * The current bt_app_hf.c resampler produces exactly this format.
  *
- * @param stereo_pcm Interleaved L/R samples.
- * @param frames Number of stereo frames.
- * @return ESP_OK, ESP_ERR_TIMEOUT if the complete block could not be queued,
- *         or ESP_ERR_INVALID_STATE if the mixer is not running.
+ * This function is non-blocking. ESP_ERR_TIMEOUT means the bounded low-latency
+ * HFP FIFO was full and this newest chunk was dropped instead of increasing
+ * monitoring latency.
  */
 esp_err_t audio_mixer_submit_hfp(const int32_t *stereo_pcm, size_t frames);
 
 /**
- * @brief Submit 48 kHz stereo signed 32-bit local-jingle PCM.
- *
- * The local jingle runs in its own task and may wait briefly for FIFO space.
- * The HFP callback never waits on the jingle path.
+ * Queue 48 kHz stereo signed 32-bit jingle PCM.
+ * This may wait up to timeout_ticks for FIFO space.
  */
 esp_err_t audio_mixer_submit_jingle(const int32_t *stereo_pcm,
                                     size_t frames,
                                     TickType_t timeout_ticks);
 
-/**
- * @brief Tell the mixer that the local connection jingle is active.
- *
- * While active, HFP is ducked to 20 percent and the jingle remains at 100
- * percent. When false, HFP returns to 100 percent.
- */
+/** Mark whether a local jingle is active (used for source ducking). */
 void audio_mixer_set_jingle_active(bool active);
 
 /**
- * @brief Wait until all queued jingle PCM has been rendered by the mixer.
+ * Drop any queued HFP PCM without stopping the central audio engine.
+ * CM108B USB audio and TAS5805M output continue running.
  */
-esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks);
+void audio_mixer_clear_hfp(void);
 
-bool audio_mixer_is_running(void);
+/** Wait until all queued jingle PCM has been consumed by the mixer. */
+esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __AUDIO_MIXER_H__ */
+#endif

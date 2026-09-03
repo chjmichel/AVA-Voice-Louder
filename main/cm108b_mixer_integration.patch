@@ -1,0 +1,131 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@
+         "volume_control.c"
+         "louder_tas5805m.c"
++        "audio_mixer.c"
+         "main.c"
+         "bt_app_hf.c"
+
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@
+     menu "Louder ESP32 Rev H6 audio hardware"
+@@
+     endmenu
++
++    menu "CM108B USB audio input / mixer"
++
++        config CM108B_BCLK_GPIO
++            int "CM108B DASCLK / BCLK GPIO"
++            default 18
++
++        config CM108B_LRCLK_GPIO
++            int "CM108B DALRCK / LRCLK GPIO"
++            default 19
++
++        config CM108B_DATA_GPIO
++            int "CM108B SDOUT / DATA GPIO"
++            default 23
++
++        config AUDIO_MIX_USB_GAIN_PERCENT
++            int "USB audio mixer gain (%)"
++            range 0 100
++            default 70
++
++        config AUDIO_MIX_HFP_GAIN_PERCENT
++            int "HFP microphone mixer gain (%)"
++            range 0 100
++            default 70
++
++    endmenu
+
+diff --git a/main/bt_app_hf.c b/main/bt_app_hf.c
+--- a/main/bt_app_hf.c
++++ b/main/bt_app_hf.c
+@@
+ #include "bt_app_hf.h"
+ #include "volume_control.h"
+ #include "louder_tas5805m.h"
++#include "audio_mixer.h"
+@@
+-#define SAMPLE_RATE 44100  // Audio sample rate for Louder H6 / TAS5805M
++#define SAMPLE_RATE 48000  // Common mixer/output sample rate
+@@
+-// Resample Function (Linear Interpolation) - HFP mono to TAS5805M stereo
+-void resample_linear_stereo(const int16_t *input, int input_size, int32_t *output, int *output_size)
+-{
+-    float ratio = 44100.0 / 16000.0; // 2.75625
+-    int output_samples = (int)(input_size * ratio);
+-
+-    for (int i = 0; i < output_samples; i++)
+-    {
+-        float src_index = i / ratio;
+-        int index = (int)src_index;
+-        float fraction = src_index - index;
+-
+-        int16_t sample1 = input[index];
+-        int16_t sample2 = (index + 1 < input_size) ? input[index + 1] : sample1;
+-        int16_t interpolated = sample1 + (int16_t)((sample2 - sample1) * fraction);
+-
+-        output[i * 2] = ((int32_t)interpolated) << 16;
+-        output[i * 2 + 1] = ((int32_t)interpolated) << 16;
+-    }
+-
+-    *output_size = output_samples * 2;
+-}
+-
+-// Bluetooth Incoming Audio Callback Function - TAS5805M stereo output
++// Bluetooth Incoming Audio Callback.
++// IMPORTANT: Never block and never write I2S here. The low-latency mixer owns
++// the only TAS5805M TX stream.
+ void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
+ {
+-    const int16_t *input = (const int16_t *)buf;
+-    int input_size = sz / 2; // Convert bytes to samples
+-
+-    static int32_t resampled_buffer[BUFFER_SIZE * 6]; // Larger buffer for 32-bit stereo
+-    int output_size;
+-
+-    resample_linear_stereo(input, input_size, resampled_buffer, &output_size);
+-
+-    size_t bytes_written;
+-    i2s_channel_write(tx_chan, resampled_buffer, output_size * 4,
+-                      &bytes_written, portMAX_DELAY);
++    audio_mixer_push_hfp(buf, sz);
+
+ #if CONFIG_ENABLE_SD_RECORDING
+     if (sdcard_initialized && record_file)
+@@
+     esp_err_t amp_ret = louder_tas5805m_start();
+     if (amp_ret != ESP_OK) {
+@@
+         return amp_ret;
+     }
++
++    /*
++     * Start CM108B RX + software mixer only after TAS5805M TX is enabled.
++     * GPIO18 = DASCLK/BCLK, GPIO19 = DALRCK/LRCLK, GPIO23 = SDOUT.
++     */
++    ret = audio_mixer_start(tx_chan);
++    if (ret != ESP_OK) {
++        ESP_LOGE("AUDIO", "CM108B/HFP mixer failed to start: %s",
++                 esp_err_to_name(ret));
++        louder_tas5805m_stop();
++        if (i2s_enabled) {
++            i2s_channel_disable(tx_chan);
++            i2s_enabled = false;
++        }
++        return ret;
++    }
+@@
+ void bt_app_stop_audio(void)
+ {
+     ESP_LOGI("AUDIO", "Shutting down audio...");
++
++    // Stop mixer first: it owns I2S1 RX and writes to I2S0 TX.
++    audio_mixer_stop();
+
+     // Put the TAS5805M in Hi-Z/PWDN while I2S clocks are still available.

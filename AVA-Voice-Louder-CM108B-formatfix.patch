@@ -1,0 +1,326 @@
+diff -ruN cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/FIX_CM108B_16BIT_32SLOT.md AVA-Voice-Louder-CM108B-formatfix/FIX_CM108B_16BIT_32SLOT.md
+--- cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/FIX_CM108B_16BIT_32SLOT.md	1970-01-01 00:00:00.000000000 +0000
++++ AVA-Voice-Louder-CM108B-formatfix/FIX_CM108B_16BIT_32SLOT.md	2026-08-31 20:18:08.825066355 +0000
+@@ -0,0 +1,42 @@
++# CM108B 16-bit PCM / 32-bit slot fix
++
++## Problem
++
++The CM108B playback interface uses 64 BCLK ticks per stereo frame (32 per
++channel), while the integrated USB DAC/PCM path is 16-bit. Treating the entire
++slot as 32 valid audio bits can distort the received samples.
++
++## Fix
++
++I2S1 RX is now configured as:
++
++- ESP32 role: slave
++- Philips I2S
++- valid data width: 16 bit
++- slot width: 32 bit
++- WS width: 32 BCLK
++- stereo
++- BCLK GPIO18
++- LRCLK GPIO19
++- DATA GPIO23
++
++ESP-IDF returns signed `int16_t` samples for this configuration. The CM108B RX
++task explicitly promotes them to the mixer's signed 32-bit full-scale domain
++before queuing them.
++
++## Sample-rate diagnostic
++
++The CM108B is the clock master, so the software now measures the real input
++sample rate from completed RX blocks instead of assuming Android selected
++48 kHz. Expect one of these messages after about two seconds of active clocks:
++
++    AUDIO_MIXER: CM108B measured input rate: 48000.x Hz (48 kHz, ... blocks)
++
++or
++
++    AUDIO_MIXER: CM108B measured input rate: 44100.x Hz (44.1 kHz, ... blocks)
++
++If 44.1 kHz is reported while the TAS5805M mixer consumes 48 kHz, the next
++required change is an asynchronous 44.1 -> 48 kHz resampler / clock-domain
++rate matcher. Do not compensate that mismatch by increasing FIFO size because
++that only turns it into periodic underflow/overflow and latency.
+diff -ruN cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/main/README_CM108B_MIXER.md AVA-Voice-Louder-CM108B-formatfix/main/README_CM108B_MIXER.md
+--- cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/main/README_CM108B_MIXER.md	2026-08-31 19:53:52.000000000 +0000
++++ AVA-Voice-Louder-CM108B-formatfix/main/README_CM108B_MIXER.md	2026-08-31 20:18:53.060174178 +0000
+@@ -27,16 +27,45 @@
+ 
+ The mixer is the only task that writes to the TAS5805M I2S TX channel.
+ 
+-## Important implementation detail
++## CM108B I2S format
+ 
+-The CM108B clock does NOT pace the mixer. The mixer is paced by the 48 kHz
+-TAS5805M TX channel. CM108B RX is read with zero timeout so HFP keeps playing
+-even if Android has no active USB audio stream or the CM108B clocks stop.
++The CM108B playback stream has 16 valid PCM bits but uses 32 BCLK ticks per
++channel slot (64 BCLK per stereo frame). I2S1 RX is therefore configured as:
++
++- role: slave
++- Philips I2S
++- data bit width: 16 bit
++- slot bit width: 32 bit
++- WS width: 32 BCLK
++- stereo
++
++ESP-IDF returns signed 16-bit samples. The dedicated `cm108b_rx` task promotes
++those samples to the common signed 32-bit mixer domain before writing complete
++5 ms blocks to a small bounded FIFO.
++
++## Independent clock domains
++
++The CM108B clock does NOT pace the central mixer. A dedicated RX task blocks on
++the external CM108B clock and fills a small FIFO. The mixer is paced by the
++48 kHz TAS5805M TX channel. This keeps HFP operational even if Android/CM108B
++stops sending audio clocks.
++
++The code also measures the real CM108B input rate. Expect a log such as:
++
++    AUDIO_MIXER: CM108B measured input rate: 48000.x Hz (48 kHz, ... blocks)
++
++or:
++
++    AUDIO_MIXER: CM108B measured input rate: 44100.x Hz (44.1 kHz, ... blocks)
++
++If 44.1 kHz is detected while the output is 48 kHz, an asynchronous
++44.1 -> 48 kHz rate conversion is required; increasing FIFO depth is not a
++correct fix for that clock-rate mismatch.
+ 
+ ## HFP API
+ 
+-`bt_app_hf.c` already resamples CVSD (8 kHz) and mSBC (16 kHz) to 48 kHz
+-stereo 32-bit PCM, then calls:
++`bt_app_hf.c` resamples CVSD (8 kHz) and mSBC (16 kHz) to 48 kHz stereo
++32-bit PCM, then calls:
+ 
+     audio_mixer_submit_hfp(resampled_buffer, frames);
+ 
+@@ -45,8 +74,9 @@
+ 
+ ## First test
+ 
+-1. Reconfigure/build with ESP-IDF 5.3.1.
+-2. Boot and establish HFP audio.
+-3. Confirm log: `Central mixer started`.
++1. Run `idf.py fullclean` and rebuild with ESP-IDF 5.3.1.
++2. Boot without requiring an HFP headset.
++3. Confirm `Central mixer started` and the `CM108B RX task started` message.
+ 4. Play audio on the Samsung routed to CM108B.
+-5. Both Samsung audio and HFP microphone should be present at the speaker.
++5. Note the `CM108B measured input rate` log line.
++6. Connect HFP; Samsung audio and HFP microphone should then be mixed together.
+diff -ruN cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/main/audio_mixer.c AVA-Voice-Louder-CM108B-formatfix/main/audio_mixer.c
+--- cm108b_formatfix/AVA-Voice-Louder-CM108B-clockfix/main/audio_mixer.c	2026-08-31 20:09:28.000000000 +0000
++++ AVA-Voice-Louder-CM108B-formatfix/main/audio_mixer.c	2026-08-31 20:18:08.686841185 +0000
+@@ -7,6 +7,7 @@
+ 
+ #include "driver/i2s_std.h"
+ #include "esp_log.h"
++#include "esp_timer.h"
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/stream_buffer.h"
+ #include "freertos/task.h"
+@@ -77,10 +78,15 @@
+  * Keep all large audio blocks in static RAM rather than on the FreeRTOS
+  * task stacks. The earlier stack-local buffers caused the observed overflow.
+  */
+-/* CM108B uses 64 BCLKs/frame: two 32-bit I2S slots. Its actual USB PCM is
+- * 16-bit and occupies the MSBs of each 32-bit slot, so the captured int32_t
+- * value is already in the same Q31-style domain used by the output mixer. */
+-static int32_t s_usb_rx_block[MIX_FRAMES * MIX_CHANNELS];
++/*
++ * CM108B playback is 16-bit PCM transported in 32-bit I2S slots
++ * (64 BCLK per stereo frame). ESP-IDF therefore receives int16_t samples
++ * when data_bit_width=16, even though slot_bit_width is 32. Convert those
++ * signed 16-bit samples explicitly into the Q31-style domain used by the
++ * central mixer/TAS5805M output.
++ */
++static int16_t s_usb_rx_raw[MIX_FRAMES * MIX_CHANNELS];
++static int32_t s_usb_rx_mix[MIX_FRAMES * MIX_CHANNELS];
+ static int32_t s_usb_block[MIX_FRAMES * MIX_CHANNELS];
+ static int32_t s_hfp_block[MIX_FRAMES * MIX_CHANNELS];
+ static int32_t s_jingle_block[MIX_FRAMES * MIX_CHANNELS];
+@@ -232,15 +238,19 @@
+     (void)arg;
+ 
+     ESP_LOGI(TAG,
+-             "CM108B RX task started: 48 kHz stereo, Philips I2S, 32-bit slots (BCLK=64*Fs)");
++             "CM108B RX task started: external-clock slave, 16-bit PCM in "
++             "32-bit Philips-I2S slots (64 BCLK/frame)");
+ 
+     bool first_audio_logged = false;
++    int64_t rate_window_start_us = esp_timer_get_time();
++    uint32_t rate_window_blocks = 0U;
++    uint32_t rate_report_count = 0U;
+ 
+     while (s_running) {
+         size_t got = 0U;
+         const esp_err_t ret = i2s_channel_read(s_rx_chan,
+-                                               s_usb_rx_block,
+-                                               sizeof(s_usb_rx_block),
++                                               s_usb_rx_raw,
++                                               sizeof(s_usb_rx_raw),
+                                                &got,
+                                                I2S_RX_TIMEOUT_MS);
+ 
+@@ -261,38 +271,86 @@
+             continue;
+         }
+ 
+-        if (got != sizeof(s_usb_rx_block)) {
++        if (got != sizeof(s_usb_rx_raw)) {
+             ++s_usb_partial_blocks;
+             if ((s_usb_partial_blocks % 100U) == 1U) {
+                 ESP_LOGW(TAG,
+                          "CM108B partial I2S block: %u/%u bytes",
+                          (unsigned)got,
+-                         (unsigned)sizeof(s_usb_rx_block));
++                         (unsigned)sizeof(s_usb_rx_raw));
+             }
+             continue;
+         }
+ 
+         ++s_usb_rx_blocks;
++        ++rate_window_blocks;
+ 
+-        if (!first_audio_logged) {
+-            int32_t peak = 0;
+-            for (size_t i = 0; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
+-                int64_t v = s_usb_rx_block[i];
+-                if (v < 0) v = -v;
+-                if (v > peak) peak = (v > INT32_MAX) ? INT32_MAX : (int32_t)v;
++        /*
++         * ESP-IDF returns one signed int16_t per active channel because the
++         * configured DATA width is 16 bits. The hardware still consumes the
++         * full 32-bit slot on BCLK/WS. Promote to the mixer's signed 32-bit
++         * full-scale domain. Multiplication is used instead of left-shifting
++         * negative signed values.
++         */
++        int16_t raw_peak = 0;
++        for (size_t i = 0; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
++            const int16_t sample = s_usb_rx_raw[i];
++            s_usb_rx_mix[i] = (int32_t)sample * 65536;
++
++            int32_t mag = sample;
++            if (mag < 0) {
++                mag = -mag;
+             }
+-            if (peak > 0) {
+-                ESP_LOGI(TAG,
+-                         "CM108B digital audio detected (first block peak=0x%08lx)",
+-                         (unsigned long)peak);
+-                first_audio_logged = true;
++            if (mag > raw_peak) {
++                raw_peak = (mag > INT16_MAX) ? INT16_MAX : (int16_t)mag;
+             }
+         }
+ 
++        if (!first_audio_logged && raw_peak > 0) {
++            ESP_LOGI(TAG,
++                     "CM108B digital audio detected (16-bit peak=%d / 32767)",
++                     (int)raw_peak);
++            first_audio_logged = true;
++        }
++
++        /*
++         * Measure the source clock instead of assuming Android selected
++         * 48 kHz. In slave mode the real rate comes from CM108B DALRCK.
++         * Report the first 2-second window, then approximately every 10 s.
++         */
++        const int64_t now_us = esp_timer_get_time();
++        const int64_t elapsed_us = now_us - rate_window_start_us;
++        const int64_t report_interval_us = (rate_report_count == 0U)
++                                               ? 2000000LL
++                                               : 10000000LL;
++        if (elapsed_us >= report_interval_us && rate_window_blocks > 0U) {
++            const uint64_t frames = (uint64_t)rate_window_blocks * MIX_FRAMES;
++            const uint64_t rate_x10 = (frames * 10000000ULL) / (uint64_t)elapsed_us;
++            const uint32_t rate_hz = (uint32_t)((rate_x10 + 5ULL) / 10ULL);
++
++            const char *rate_name = "other";
++            if (rate_hz >= 47800U && rate_hz <= 48200U) {
++                rate_name = "48 kHz";
++            } else if (rate_hz >= 43900U && rate_hz <= 44300U) {
++                rate_name = "44.1 kHz";
++            }
++
++            ESP_LOGI(TAG,
++                     "CM108B measured input rate: %lu.%01lu Hz (%s, %lu blocks)",
++                     (unsigned long)(rate_x10 / 10ULL),
++                     (unsigned long)(rate_x10 % 10ULL),
++                     rate_name,
++                     (unsigned long)rate_window_blocks);
++
++            rate_window_start_us = now_us;
++            rate_window_blocks = 0U;
++            ++rate_report_count;
++        }
++
+         /* One producer / one consumer. Never block the CM108B clock-domain
+          * task. If the small FIFO is full, drop the newest complete 5 ms block
+          * rather than allowing latency to grow without bound. */
+-        if (xStreamBufferSpacesAvailable(s_usb_fifo) < sizeof(s_usb_rx_block)) {
++        if (xStreamBufferSpacesAvailable(s_usb_fifo) < sizeof(s_usb_rx_mix)) {
+             ++s_usb_fifo_drops;
+             if ((s_usb_fifo_drops % 100U) == 1U) {
+                 ESP_LOGW(TAG,
+@@ -303,10 +361,10 @@
+         }
+ 
+         const size_t sent = xStreamBufferSend(s_usb_fifo,
+-                                              s_usb_rx_block,
+-                                              sizeof(s_usb_rx_block),
++                                              s_usb_rx_mix,
++                                              sizeof(s_usb_rx_mix),
+                                               0);
+-        if (sent != sizeof(s_usb_rx_block)) {
++        if (sent != sizeof(s_usb_rx_mix)) {
+             ++s_usb_fifo_drops;
+         }
+     }
+@@ -383,8 +441,8 @@
+                                     : 100;
+ 
+         for (size_t i = 0U; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
+-            /* CM108B 16-bit PCM is captured in the MSBs of a 32-bit slot,
+-             * so it already matches the mix/output numeric domain. */
++            /* CM108B int16_t PCM was promoted to the common 32-bit
++             * full-scale mixer domain by usb_rx_task(). */
+             const int32_t usb32 = s_usb_block[i];
+ 
+             int64_t mixed = 0;
+@@ -507,16 +565,22 @@
+         return ret;
+     }
+ 
++    /*
++     * CM108B sends 16 valid PCM bits inside a 32-BCLK slot. Keep DATA width
++     * and SLOT width separate. On ESP32 the helper macro also sets ws_width
++     * to data_bit_width, so override both slot_bit_width and ws_width after
++     * creating the 16-bit Philips-I2S configuration.
++     */
++    i2s_std_slot_config_t cm108b_slot =
++        I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
++            I2S_DATA_BIT_WIDTH_16BIT,
++            I2S_SLOT_MODE_STEREO);
++    cm108b_slot.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
++    cm108b_slot.ws_width = 32U;
++
+     i2s_std_config_t rx_cfg = {
+         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_MIXER_SAMPLE_RATE_HZ),
+-        /* CM108B datasheet: BCLK is fixed at 64 * Fs. That means two
+-         * 32-bit slots per stereo frame. The embedded DAC/USB PCM is 16-bit;
+-         * the remaining clocks are padding. Capturing the full 32-bit Philips
+-         * slot preserves framing and places the signed 16-bit sample in the
+-         * MSBs, exactly matching our Q31-style mixer domain. */
+-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+-            I2S_DATA_BIT_WIDTH_32BIT,
+-            I2S_SLOT_MODE_STEREO),
++        .slot_cfg = cm108b_slot,
+         .gpio_cfg = {
+             .mclk = I2S_GPIO_UNUSED,
+             .bclk = CONFIG_CM108B_BCLK_GPIO,

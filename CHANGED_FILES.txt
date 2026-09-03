@@ -1,0 +1,13 @@
+Changed files relative to the uploaded AVA-Voice-Louder project:
+
+main/Kconfig.projbuild
+main/README_CM108B_MIXER.md
+main/audio_mixer.c
+main/audio_mixer.h
+main/bt_app_hf.c
+sdkconfig.defaults
+sdkconfig.defaults.esp32
+
+Additional reference files:
+CM108B_MIXER_FIX.patch
+CM108B_MIXER_FIX_NOTES.md

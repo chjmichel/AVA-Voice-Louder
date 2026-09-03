@@ -1,0 +1,948 @@
+diff -ruN /mnt/data/ava_louder_original/main/Kconfig.projbuild /mnt/data/ava_louder_src/main/Kconfig.projbuild
+--- /mnt/data/ava_louder_original/main/Kconfig.projbuild	2026-08-30 18:31:10.000000000 +0000
++++ /mnt/data/ava_louder_src/main/Kconfig.projbuild	2026-08-31 19:19:15.735049304 +0000
+@@ -72,6 +72,54 @@
+ 
+     endmenu
+ 
++    menu "CM108B USB audio input / central mixer"
++
++        config CM108B_BCLK_GPIO
++            int "CM108B DASCLK/BCLK GPIO"
++            default 18
++            help
++                CM108B I2S bit clock output. Connect DASCLK to ESP32 GPIO18.
++
++        config CM108B_LRCLK_GPIO
++            int "CM108B DALRCK/LRCLK GPIO"
++            default 19
++            help
++                CM108B I2S word-select output. Connect DALRCK to ESP32 GPIO19.
++
++        config CM108B_DATA_GPIO
++            int "CM108B SDOUT/DATA GPIO"
++            default 23
++            help
++                CM108B I2S playback data output. Connect SDOUT to ESP32 GPIO23.
++
++        config AUDIO_MIX_USB_GAIN_PERCENT
++            int "Samsung/CM108B mixer gain (%)"
++            range 0 100
++            default 70
++            help
++                Gain applied to USB audio before mixing.
++
++        config AUDIO_MIX_HFP_GAIN_PERCENT
++            int "HFP microphone mixer gain (%)"
++            range 0 100
++            default 100
++            help
++                Gain applied to the resampled headset microphone before mixing.
++
++        config AUDIO_MIX_JINGLE_GAIN_PERCENT
++            int "AVA jingle mixer gain (%)"
++            range 0 100
++            default 100
++
++        config AUDIO_MIX_JINGLE_DUCK_PERCENT
++            int "USB/HFP level while AVA jingle plays (%)"
++            range 0 100
++            default 0
++            help
++                0 mutes USB/HFP while the connection jingle is active.
++
++    endmenu
++
+     menu "Potentiometer volume control"
+ 
+         config VOLUME_POT_GPIO
+diff -ruN /mnt/data/ava_louder_original/main/README_CM108B_MIXER.md /mnt/data/ava_louder_src/main/README_CM108B_MIXER.md
+--- /mnt/data/ava_louder_original/main/README_CM108B_MIXER.md	2026-08-31 21:10:34.000000000 +0000
++++ /mnt/data/ava_louder_src/main/README_CM108B_MIXER.md	2026-08-31 19:19:15.862853825 +0000
+@@ -1,6 +1,6 @@
+-# AVA Coach: CM108B + HFP mixer for Louder H6
++# AVA Coach - CM108B + HFP central mixer
+ 
+-Target: ESP-IDF 5.3.1, classic ESP32, Sonocotta Louder Rev H6 / TAS5805M.
++Target: ESP-IDF 5.3.1, classic ESP32, Louder Rev H6 / TAS5805M.
+ 
+ ## Wiring
+ 
+@@ -12,73 +12,41 @@
+ - GND -> GND
+ - DAMCLK / MCLK -> not connected
+ 
+-Existing Louder TAS5805M wiring remains:
++Existing TAS5805M output remains:
+ 
+ - GPIO26 -> BCLK
+ - GPIO25 -> LRCLK
+-- GPIO22 -> DATA OUT
++- GPIO22 -> DATA
+ 
+-## Architecture
++## Audio architecture
+ 
+ Samsung A16 -> powered USB hub -> CM108B -> I2S1 RX (ESP32 slave)
+-                                            |
+-Bluetooth HFP mic -> HFP callback -> FIFO --+-> mixer 48 kHz stereo
+-                                            |
+-                                            +-> I2S0 TX -> TAS5805M -> speaker
++Bluetooth HFP mic -> resample 8/16 kHz mono -> 48 kHz stereo -> HFP FIFO
++AVA jingle -> 48 kHz stereo -> jingle FIFO
++All sources -> central mixer -> I2S0 TX -> TAS5805M -> speaker
+ 
+-The CM108B input and TAS5805M output intentionally use separate I2S peripherals
+-because they are separate clock domains.
++The mixer is the only task that writes to the TAS5805M I2S TX channel.
+ 
+-## Files
++## Important implementation detail
+ 
+-- `audio_mixer.c`
+-- `audio_mixer.h`
+-- `cm108b_mixer_integration.patch`
++The CM108B clock does NOT pace the mixer. The mixer is paced by the 48 kHz
++TAS5805M TX channel. CM108B RX is read with zero timeout so HFP keeps playing
++even if Android has no active USB audio stream or the CM108B clocks stop.
+ 
+-Copy `audio_mixer.c/.h` into `main/`, then apply the integration changes.
++## HFP API
+ 
+-## Important behavioral change
++`bt_app_hf.c` already resamples CVSD (8 kHz) and mSBC (16 kHz) to 48 kHz
++stereo 32-bit PCM, then calls:
+ 
+-The HFP callback must NOT write directly to `tx_chan` anymore. It only calls:
++    audio_mixer_submit_hfp(resampled_buffer, frames);
+ 
+-    audio_mixer_push_hfp(buf, sz);
+-
+-The mixer task is the only continuous writer to the TAS5805M I2S TX channel.
+-
+-## Output rate
+-
+-Change the Louder/TAS5805M I2S output from 44.1 kHz to **48 kHz**.
+-
+-This gives an exact HFP conversion ratio:
+-
+-    16 kHz HFP -> 48 kHz mixer = 3:1
+-
+-and matches the intended CM108B USB playback rate.
+-
+-## Latency
+-
+-- Mixer block: 5 ms
+-- HFP FIFO: max about 20 ms
+-- FIFO overflow policy: drop oldest HFP audio instead of accumulating delay
+-- CM108B is read in 5 ms blocks
+-
+-This is specifically designed to avoid the earlier "FIFO full -> increasing
+-echo/latency" behavior.
++A full low-latency FIFO returns ESP_ERR_TIMEOUT and drops the newest chunk
++rather than allowing delay to grow without bound.
+ 
+ ## First test
+ 
+-1. Boot without HFP and play audio from Samsung to CM108B.
+-2. Confirm log contains `Mixer running`.
+-3. Confirm Samsung audio is audible through the Louder speaker.
+-4. Connect HFP headset.
+-5. Speak into headset while Samsung audio is playing.
+-6. Both signals should be audible simultaneously.
+-7. Watch for `HFP low-latency FIFO dropped ...` warnings.
+-   Occasional drops under startup/transients are preferable to latency growth;
+-   continuous drops mean producer/consumer timing needs adjustment.
+-
+-## Note about CM108B I2S format
+-
+-The code assumes CM108B playback output is standard Philips I2S, 16-bit stereo,
+-48 kHz. If your development board straps the CM108B digital interface for a
+-different serial format, the ESP32 slot configuration must be adjusted.
++1. Reconfigure/build with ESP-IDF 5.3.1.
++2. Boot and establish HFP audio.
++3. Confirm log: `Central mixer started`.
++4. Play audio on the Samsung routed to CM108B.
++5. Both Samsung audio and HFP microphone should be present at the speaker.
+diff -ruN /mnt/data/ava_louder_original/main/audio_mixer.c /mnt/data/ava_louder_src/main/audio_mixer.c
+--- /mnt/data/ava_louder_original/main/audio_mixer.c	2026-08-31 21:10:34.000000000 +0000
++++ /mnt/data/ava_louder_src/main/audio_mixer.c	2026-08-31 19:19:00.336733584 +0000
+@@ -1,5 +1,6 @@
+ #include "audio_mixer.h"
+ 
++#include <limits.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -12,28 +13,15 @@
+ 
+ static const char *TAG = "AUDIO_MIXER";
+ 
+-/*
+- * AVA fixed audio format.
+- *
+- * CM108B playback is configured as 48 kHz / 16-bit stereo.
+- * HFP mSBC PCM is 16 kHz / 16-bit mono.
+- * TAS5805M output uses 48 kHz stereo with 32-bit slots.
+- */
+-#define MIX_RATE_HZ                 48000
+-#define HFP_RATE_HZ                 16000
+-#define MIX_FRAMES                  240     /* 5 ms @ 48 kHz */
+-#define HFP_SAMPLES_PER_BLOCK       (MIX_FRAMES / 3) /* 80 samples = 5 ms */
+-#define USB_BYTES_PER_FRAME         4       /* int16 L + int16 R */
+-#define USB_BLOCK_BYTES             (MIX_FRAMES * USB_BYTES_PER_FRAME)
+-#define HFP_BLOCK_BYTES             (HFP_SAMPLES_PER_BLOCK * sizeof(int16_t))
+-
+-/*
+- * Keep FIFOs intentionally small. The goal is live monitoring, not lossless
+- * buffering. Large queues immediately become audible echo/latency.
+- */
+-#define HFP_FIFO_BYTES              (HFP_BLOCK_BYTES * 4)  /* ~20 ms */
+-#define USB_READ_TIMEOUT_MS         8
+-#define HFP_READ_TIMEOUT_MS         0
++/* 5 ms output blocks keep monitoring latency small while avoiding tiny writes. */
++#define MIX_FRAMES                 240U
++#define MIX_CHANNELS               2U
++#define MIX_BYTES_32               (MIX_FRAMES * MIX_CHANNELS * sizeof(int32_t))
++#define USB_BYTES_16               (MIX_FRAMES * MIX_CHANNELS * sizeof(int16_t))
++
++/* Bounded producer FIFOs. HFP stays intentionally small to avoid audible echo. */
++#define HFP_FIFO_BYTES             (MIX_BYTES_32 * 4U)   /* ~20 ms */
++#define JINGLE_FIFO_BYTES          (MIX_BYTES_32 * 12U)  /* ~60 ms */
+ 
+ #ifndef CONFIG_CM108B_BCLK_GPIO
+ #define CONFIG_CM108B_BCLK_GPIO 18
+@@ -48,196 +36,233 @@
+ #define CONFIG_AUDIO_MIX_USB_GAIN_PERCENT 70
+ #endif
+ #ifndef CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT
+-#define CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT 70
++#define CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT 100
++#endif
++#ifndef CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT
++#define CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT 100
++#endif
++#ifndef CONFIG_AUDIO_MIX_JINGLE_DUCK_PERCENT
++#define CONFIG_AUDIO_MIX_JINGLE_DUCK_PERCENT 0
+ #endif
+ 
+ static i2s_chan_handle_t s_rx_chan = NULL;
+ static i2s_chan_handle_t s_tx_chan = NULL;
+ static StreamBufferHandle_t s_hfp_fifo = NULL;
++static StreamBufferHandle_t s_jingle_fifo = NULL;
+ static TaskHandle_t s_mixer_task = NULL;
++
+ static volatile bool s_running = false;
++static volatile bool s_jingle_active = false;
+ 
+-static uint32_t s_hfp_drop_bytes = 0;
+-static uint32_t s_usb_short_reads = 0;
++static uint32_t s_hfp_drop_chunks = 0U;
++static uint32_t s_usb_empty_blocks = 0U;
++static uint32_t s_usb_partial_blocks = 0U;
+ 
+-static inline int16_t clamp16(int32_t v)
++static int32_t clamp_i32(int64_t value)
+ {
+-    if (v > 32767) return 32767;
+-    if (v < -32768) return -32768;
+-    return (int16_t)v;
++    if (value > INT32_MAX) {
++        return INT32_MAX;
++    }
++    if (value < INT32_MIN) {
++        return INT32_MIN;
++    }
++    return (int32_t)value;
+ }
+ 
+ /*
+- * Drop enough OLD HFP PCM to make room for the newest callback.
+- * This is deliberate: when overloaded we prefer a tiny discontinuity over
+- * continuously increasing microphone delay / echo.
++ * StreamBuffer is deliberately used with one producer and one consumer per
++ * source. To preserve stereo-frame alignment, a producer only writes when the
++ * complete chunk fits; partial writes are never allowed.
+  */
+-static void hfp_make_room(size_t needed)
++static esp_err_t stream_send_complete(StreamBufferHandle_t stream,
++                                      const void *data,
++                                      size_t bytes,
++                                      TickType_t timeout_ticks)
+ {
+-    uint8_t scratch[160];
+-
+-    if (s_hfp_fifo == NULL) {
+-        return;
++    if (stream == NULL || data == NULL || bytes == 0U) {
++        return ESP_ERR_INVALID_ARG;
+     }
+ 
+-    size_t free_bytes = xStreamBufferSpacesAvailable(s_hfp_fifo);
+-    while (free_bytes < needed) {
+-        size_t want = needed - free_bytes;
+-        if (want > sizeof(scratch)) {
+-            want = sizeof(scratch);
++    const TickType_t start = xTaskGetTickCount();
++
++    while (xStreamBufferSpacesAvailable(stream) < bytes) {
++        if (timeout_ticks == 0U) {
++            return ESP_ERR_TIMEOUT;
+         }
+ 
+-        size_t removed = xStreamBufferReceive(s_hfp_fifo, scratch, want, 0);
+-        if (removed == 0) {
+-            break;
++        if ((xTaskGetTickCount() - start) >= timeout_ticks) {
++            return ESP_ERR_TIMEOUT;
+         }
+ 
+-        s_hfp_drop_bytes += removed;
+-        free_bytes = xStreamBufferSpacesAvailable(s_hfp_fifo);
++        vTaskDelay(1);
+     }
++
++    const size_t sent = xStreamBufferSend(stream, data, bytes, 0);
++    return (sent == bytes) ? ESP_OK : ESP_ERR_TIMEOUT;
+ }
+ 
+-void audio_mixer_push_hfp(const uint8_t *data, uint32_t size)
++esp_err_t audio_mixer_submit_hfp(const int32_t *stereo_pcm, size_t frames)
+ {
+-    if (!s_running || s_hfp_fifo == NULL || data == NULL || size == 0) {
+-        return;
++    if (!s_running || s_hfp_fifo == NULL) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (stereo_pcm == NULL || frames == 0U) {
++        return ESP_ERR_INVALID_ARG;
+     }
+ 
+-    /*
+-     * StreamBuffer works with bytes, but preserve complete int16 samples.
+-     */
+-    size &= ~((uint32_t)1);
+-    if (size == 0) {
+-        return;
++    const size_t bytes = frames * MIX_CHANNELS * sizeof(int32_t);
++    if (bytes > HFP_FIFO_BYTES) {
++        ESP_LOGW(TAG, "HFP chunk too large for low-latency FIFO: %u bytes",
++                 (unsigned)bytes);
++        return ESP_ERR_INVALID_SIZE;
++    }
++
++    const esp_err_t ret = stream_send_complete(s_hfp_fifo, stereo_pcm, bytes, 0);
++    if (ret == ESP_ERR_TIMEOUT) {
++        ++s_hfp_drop_chunks;
++        if ((s_hfp_drop_chunks % 100U) == 0U) {
++            ESP_LOGW(TAG,
++                     "HFP mixer FIFO full; dropped newest chunk (drops=%lu)",
++                     (unsigned long)s_hfp_drop_chunks);
++        }
++    }
++    return ret;
++}
++
++esp_err_t audio_mixer_submit_jingle(const int32_t *stereo_pcm,
++                                    size_t frames,
++                                    TickType_t timeout_ticks)
++{
++    if (!s_running || s_jingle_fifo == NULL) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (stereo_pcm == NULL || frames == 0U) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    const size_t bytes = frames * MIX_CHANNELS * sizeof(int32_t);
++    if (bytes > JINGLE_FIFO_BYTES) {
++        return ESP_ERR_INVALID_SIZE;
+     }
+ 
+-    if (size > HFP_FIFO_BYTES) {
+-        data += (size - HFP_FIFO_BYTES);
+-        size = HFP_FIFO_BYTES;
++    return stream_send_complete(s_jingle_fifo, stereo_pcm, bytes, timeout_ticks);
++}
++
++void audio_mixer_set_jingle_active(bool active)
++{
++    s_jingle_active = active;
++}
++
++esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks)
++{
++    if (!s_running || s_jingle_fifo == NULL) {
++        return ESP_ERR_INVALID_STATE;
+     }
+ 
+-    hfp_make_room(size);
++    const TickType_t start = xTaskGetTickCount();
++    while (xStreamBufferBytesAvailable(s_jingle_fifo) != 0U) {
++        if (timeout_ticks == 0U ||
++            (xTaskGetTickCount() - start) >= timeout_ticks) {
++            return ESP_ERR_TIMEOUT;
++        }
++        vTaskDelay(1);
++    }
++
++    /* Allow the last 5 ms block already handed to I2S DMA to leave the FIFO. */
++    vTaskDelay(pdMS_TO_TICKS(6));
++    return ESP_OK;
++}
+ 
+-    size_t sent = xStreamBufferSend(s_hfp_fifo, data, size, 0);
+-    if (sent < size) {
+-        s_hfp_drop_bytes += size - sent;
++static size_t receive_source(StreamBufferHandle_t stream,
++                             int32_t *dst,
++                             size_t dst_bytes)
++{
++    memset(dst, 0, dst_bytes);
++    if (stream == NULL) {
++        return 0U;
+     }
+ 
+-    if (s_hfp_drop_bytes != 0 && (s_hfp_drop_bytes % 3200) < size) {
+-        ESP_LOGW(TAG, "HFP low-latency FIFO dropped %lu bytes total",
+-                 (unsigned long)s_hfp_drop_bytes);
++    const size_t got = xStreamBufferReceive(stream, dst, dst_bytes, 0);
++    if (got < dst_bytes) {
++        memset(((uint8_t *)dst) + got, 0, dst_bytes - got);
+     }
++    return got;
+ }
+ 
+ static void mixer_task(void *arg)
+ {
+-    int16_t usb[MIX_FRAMES * 2];
+-    int16_t hfp[HFP_SAMPLES_PER_BLOCK];
+-    int32_t out[MIX_FRAMES * 2];
++    (void)arg;
++
++    int16_t usb[MIX_FRAMES * MIX_CHANNELS];
++    int32_t hfp[MIX_FRAMES * MIX_CHANNELS];
++    int32_t jingle[MIX_FRAMES * MIX_CHANNELS];
++    int32_t out[MIX_FRAMES * MIX_CHANNELS];
+ 
+     ESP_LOGI(TAG,
+-             "Mixer running: USB I2S1 RX GPIO BCLK=%d LRCLK=%d DATA=%d; "
+-             "48k stereo + HFP 16k mono -> TAS5805M",
++             "Central mixer started: CM108B I2S1 RX slave BCLK=%d LRCLK=%d DATA=%d; "
++             "USB + HFP + jingle -> 48 kHz TAS5805M",
+              CONFIG_CM108B_BCLK_GPIO,
+              CONFIG_CM108B_LRCLK_GPIO,
+              CONFIG_CM108B_DATA_GPIO);
+ 
+     while (s_running) {
+         memset(usb, 0, sizeof(usb));
+-        memset(hfp, 0, sizeof(hfp));
+ 
+         /*
+-         * CM108B is the clock master. A normal 5 ms I2S read therefore also
+-         * provides the pacing for this mixer.
+-         *
+-         * If USB audio is absent, timeout and continue with HFP only.
++         * Never pace the output from the CM108B clock. The CM108B may stop its
++         * clocks while Android is not playing audio. A zero-timeout read keeps
++         * HFP output alive; the TAS5805M TX write below is the 48 kHz pacer.
+          */
+-        size_t usb_got = 0;
+-        esp_err_t rx_ret = i2s_channel_read(
+-            s_rx_chan,
+-            usb,
+-            sizeof(usb),
+-            &usb_got,
+-            pdMS_TO_TICKS(USB_READ_TIMEOUT_MS));
+-
+-        if (rx_ret != ESP_OK || usb_got < sizeof(usb)) {
+-            if (usb_got < sizeof(usb)) {
+-                memset(((uint8_t *)usb) + usb_got, 0, sizeof(usb) - usb_got);
+-            }
+-            s_usb_short_reads++;
++        size_t usb_got = 0U;
++        const esp_err_t usb_ret = i2s_channel_read(s_rx_chan,
++                                                   usb,
++                                                   sizeof(usb),
++                                                   &usb_got,
++                                                   0);
++        if (usb_ret != ESP_OK || usb_got == 0U) {
++            ++s_usb_empty_blocks;
++            usb_got = 0U;
++        } else if (usb_got < sizeof(usb)) {
++            memset(((uint8_t *)usb) + usb_got, 0, sizeof(usb) - usb_got);
++            ++s_usb_partial_blocks;
+         }
+ 
+-        /*
+-         * Consume exactly 5 ms HFP if available. Missing microphone samples
+-         * become silence. This keeps the output live without waiting for HFP.
+-         */
+-        size_t hfp_got = 0;
+-        if (s_hfp_fifo != NULL) {
+-            hfp_got = xStreamBufferReceive(
+-                s_hfp_fifo,
+-                hfp,
+-                sizeof(hfp),
+-                pdMS_TO_TICKS(HFP_READ_TIMEOUT_MS));
+-        }
+-        if (hfp_got < sizeof(hfp)) {
+-            memset(((uint8_t *)hfp) + hfp_got, 0, sizeof(hfp) - hfp_got);
+-        }
++        receive_source(s_hfp_fifo, hfp, sizeof(hfp));
++        receive_source(s_jingle_fifo, jingle, sizeof(jingle));
+ 
+-        /*
+-         * 16 -> 48 kHz: exactly 3:1.
+-         *
+-         * Linear interpolation between adjacent HFP samples is cheap and avoids
+-         * the harsher image content of simple 3x sample repetition.
+-         */
+-        for (int i = 0; i < MIX_FRAMES; i++) {
+-            int src = i / 3;
+-            int phase = i % 3;
+-
+-            int16_t a = hfp[src];
+-            int16_t b = (src + 1 < HFP_SAMPLES_PER_BLOCK) ? hfp[src + 1] : a;
+-
+-            int32_t h;
+-            if (phase == 0) {
+-                h = a;
+-            } else if (phase == 1) {
+-                h = ((int32_t)a * 2 + b) / 3;
+-            } else {
+-                h = ((int32_t)a + (int32_t)b * 2) / 3;
+-            }
+-
+-            int32_t l =
+-                ((int32_t)usb[i * 2] * CONFIG_AUDIO_MIX_USB_GAIN_PERCENT) / 100 +
+-                (h * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT) / 100;
+-            int32_t r =
+-                ((int32_t)usb[i * 2 + 1] * CONFIG_AUDIO_MIX_USB_GAIN_PERCENT) / 100 +
+-                (h * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT) / 100;
+-
+-            /*
+-             * Louder H6 currently drives TAS5805M with 32-bit slots, with the
+-             * signed 16-bit audio in the upper 16 bits.
+-             */
+-            out[i * 2]     = ((int32_t)clamp16(l)) << 16;
+-            out[i * 2 + 1] = ((int32_t)clamp16(r)) << 16;
+-        }
++        const int source_duck = s_jingle_active
++                                    ? CONFIG_AUDIO_MIX_JINGLE_DUCK_PERCENT
++                                    : 100;
++
++        for (size_t i = 0U; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
++            /* CM108B 16-bit PCM -> TAS5805M's 32-bit I2S sample domain. */
++            const int32_t usb32 = (int32_t)usb[i] * 65536;
++
++            int64_t mixed = 0;
++            mixed += ((int64_t)usb32 * CONFIG_AUDIO_MIX_USB_GAIN_PERCENT * source_duck) / 10000;
++            mixed += ((int64_t)hfp[i] * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT * source_duck) / 10000;
++            mixed += ((int64_t)jingle[i] * CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT) / 100;
+ 
+-        size_t written = 0;
+-        esp_err_t tx_ret = i2s_channel_write(
+-            s_tx_chan,
+-            out,
+-            sizeof(out),
+-            &written,
+-            pdMS_TO_TICKS(20));
++            out[i] = clamp_i32(mixed);
++        }
+ 
+-        if (tx_ret != ESP_OK) {
++        size_t written = 0U;
++        const esp_err_t tx_ret = i2s_channel_write(s_tx_chan,
++                                                   out,
++                                                   sizeof(out),
++                                                   &written,
++                                                   pdMS_TO_TICKS(20));
++        if (tx_ret != ESP_OK && s_running) {
+             ESP_LOGW(TAG, "TAS5805M I2S write failed: %s",
+                      esp_err_to_name(tx_ret));
+         }
+     }
+ 
+     ESP_LOGI(TAG,
+-             "Mixer stopped (HFP dropped=%lu bytes, USB short reads=%lu)",
+-             (unsigned long)s_hfp_drop_bytes,
+-             (unsigned long)s_usb_short_reads);
++             "Central mixer stopped (HFP drops=%lu, USB empty=%lu, USB partial=%lu)",
++             (unsigned long)s_hfp_drop_chunks,
++             (unsigned long)s_usb_empty_blocks,
++             (unsigned long)s_usb_partial_blocks);
+ 
+     s_mixer_task = NULL;
+     vTaskDelete(NULL);
+@@ -253,11 +278,13 @@
+     }
+ 
+     s_tx_chan = tx_chan;
+-    s_hfp_drop_bytes = 0;
+-    s_usb_short_reads = 0;
++    s_hfp_drop_chunks = 0U;
++    s_usb_empty_blocks = 0U;
++    s_usb_partial_blocks = 0U;
++    s_jingle_active = false;
+ 
+     if (s_hfp_fifo == NULL) {
+-        s_hfp_fifo = xStreamBufferCreate(HFP_FIFO_BYTES, 2);
++        s_hfp_fifo = xStreamBufferCreate(HFP_FIFO_BYTES, 1);
+         if (s_hfp_fifo == NULL) {
+             return ESP_ERR_NO_MEM;
+         }
+@@ -265,29 +292,37 @@
+         xStreamBufferReset(s_hfp_fifo);
+     }
+ 
+-    /*
+-     * CM108B is I2S MASTER -> ESP32 I2S1 RX must be SLAVE.
+-     */
++    if (s_jingle_fifo == NULL) {
++        s_jingle_fifo = xStreamBufferCreate(JINGLE_FIFO_BYTES, 1);
++        if (s_jingle_fifo == NULL) {
++            return ESP_ERR_NO_MEM;
++        }
++    } else {
++        xStreamBufferReset(s_jingle_fifo);
++    }
++
++    /* CM108B is I2S master, therefore ESP32 I2S1 RX must be slave. */
+     i2s_chan_config_t chan_cfg =
+         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
+ 
+     esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+     if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "Could not allocate I2S1 RX: %s", esp_err_to_name(ret));
++        s_rx_chan = NULL;
+         return ret;
+     }
+ 
+     i2s_std_config_t rx_cfg = {
+-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIX_RATE_HZ),
++        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_MIXER_SAMPLE_RATE_HZ),
+         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+             I2S_DATA_BIT_WIDTH_16BIT,
+             I2S_SLOT_MODE_STEREO),
+         .gpio_cfg = {
+             .mclk = I2S_GPIO_UNUSED,
+             .bclk = CONFIG_CM108B_BCLK_GPIO,
+-            .ws   = CONFIG_CM108B_LRCLK_GPIO,
++            .ws = CONFIG_CM108B_LRCLK_GPIO,
+             .dout = I2S_GPIO_UNUSED,
+-            .din  = CONFIG_CM108B_DATA_GPIO,
++            .din = CONFIG_CM108B_DATA_GPIO,
+             .invert_flags = {
+                 .mclk_inv = false,
+                 .bclk_inv = false,
+@@ -316,20 +351,19 @@
+ 
+     s_running = true;
+ 
+-    BaseType_t ok = xTaskCreatePinnedToCore(
+-        mixer_task,
+-        "audio_mixer",
+-        4096,
+-        NULL,
+-        20,
+-        &s_mixer_task,
+-        1);
+-
+-    if (ok != pdPASS) {
++    const BaseType_t task_ret = xTaskCreatePinnedToCore(mixer_task,
++                                                        "audio_mixer",
++                                                        4096,
++                                                        NULL,
++                                                        20,
++                                                        &s_mixer_task,
++                                                        1);
++    if (task_ret != pdPASS) {
+         s_running = false;
+         i2s_channel_disable(s_rx_chan);
+         i2s_del_channel(s_rx_chan);
+         s_rx_chan = NULL;
++        s_tx_chan = NULL;
+         return ESP_ERR_NO_MEM;
+     }
+ 
+@@ -343,9 +377,10 @@
+     }
+ 
+     s_running = false;
++    s_jingle_active = false;
+ 
+-    /* Give task enough time to leave a blocking RX/TX call. */
+-    for (int i = 0; i < 20 && s_mixer_task != NULL; i++) {
++    /* The TX writer blocks for at most 20 ms. Give it ample time to exit. */
++    for (int i = 0; i < 30 && s_mixer_task != NULL; ++i) {
+         vTaskDelay(pdMS_TO_TICKS(5));
+     }
+ 
+@@ -358,6 +393,9 @@
+     if (s_hfp_fifo != NULL) {
+         xStreamBufferReset(s_hfp_fifo);
+     }
++    if (s_jingle_fifo != NULL) {
++        xStreamBufferReset(s_jingle_fifo);
++    }
+ 
+     s_tx_chan = NULL;
+ }
+diff -ruN /mnt/data/ava_louder_original/main/audio_mixer.h /mnt/data/ava_louder_src/main/audio_mixer.h
+--- /mnt/data/ava_louder_original/main/audio_mixer.h	2026-08-31 21:10:36.000000000 +0000
++++ /mnt/data/ava_louder_src/main/audio_mixer.h	2026-08-31 19:19:00.335844650 +0000
+@@ -1,44 +1,67 @@
+ #ifndef AVA_AUDIO_MIXER_H
+ #define AVA_AUDIO_MIXER_H
+ 
++#include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+-#include "esp_err.h"
++
+ #include "driver/i2s_std.h"
++#include "esp_err.h"
++#include "freertos/FreeRTOS.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
++#define AUDIO_MIXER_SAMPLE_RATE_HZ 48000U
++#define AUDIO_MIXER_CHANNELS       2U
++
+ /**
+- * Start CM108B + HFP audio mixer.
++ * Start the central 48 kHz stereo mixer.
++ *
++ * tx_chan is the already configured/enabled I2S0 TX channel that drives the
++ * Louder H6 TAS5805M (GPIO26 BCLK, GPIO25 LRCLK, GPIO22 DATA).
+  *
+- * Output format:
+- *   48 kHz, stereo, 32-bit I2S slots to TAS5805M.
++ * The mixer additionally creates I2S1 RX as a SLAVE for the CM108B:
++ *   GPIO18 <- CM108B DASCLK/BCLK
++ *   GPIO19 <- CM108B DALRCK/LRCLK
++ *   GPIO23 <- CM108B SDOUT/DATA
+  *
+- * CM108B input:
+- *   I2S1 RX slave, 48 kHz, stereo, 16-bit.
+- *   BCLK  GPIO18
+- *   LRCLK GPIO19
+- *   DATA  GPIO23
++ * The mixer task is the ONLY writer to tx_chan after this function succeeds.
+  */
+ esp_err_t audio_mixer_start(i2s_chan_handle_t tx_chan);
+ 
+-/** Stop mixer task and CM108B I2S RX. */
++/** Stop mixer and CM108B I2S1 RX. */
+ void audio_mixer_stop(void);
+ 
++/** Returns true while the central mixer is running. */
++bool audio_mixer_is_running(void);
++
+ /**
+- * Push HFP microphone PCM into the mixer.
++ * Queue already-resampled HFP PCM.
+  *
+- * Expected HFP format:
+- *   16 kHz, mono, signed 16-bit PCM.
++ * Format: 48 kHz, stereo, signed 32-bit I2S samples, one frame = L + R.
++ * The current bt_app_hf.c resampler produces exactly this format.
+  *
+- * Non-blocking: if the low-latency FIFO is full the oldest queued audio is
+- * allowed to be dropped rather than adding latency.
++ * This function is non-blocking. ESP_ERR_TIMEOUT means the bounded low-latency
++ * HFP FIFO was full and this newest chunk was dropped instead of increasing
++ * monitoring latency.
+  */
+-void audio_mixer_push_hfp(const uint8_t *data, uint32_t size);
++esp_err_t audio_mixer_submit_hfp(const int32_t *stereo_pcm, size_t frames);
+ 
+-/** Returns true while the mixer is running. */
+-bool audio_mixer_is_running(void);
++/**
++ * Queue 48 kHz stereo signed 32-bit jingle PCM.
++ * This may wait up to timeout_ticks for FIFO space.
++ */
++esp_err_t audio_mixer_submit_jingle(const int32_t *stereo_pcm,
++                                    size_t frames,
++                                    TickType_t timeout_ticks);
++
++/** Mark whether a local jingle is active (used for source ducking). */
++void audio_mixer_set_jingle_active(bool active);
++
++/** Wait until all queued jingle PCM has been consumed by the mixer. */
++esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks);
+ 
+ #ifdef __cplusplus
+ }
+diff -ruN /mnt/data/ava_louder_original/main/bt_app_hf.c /mnt/data/ava_louder_src/main/bt_app_hf.c
+--- /mnt/data/ava_louder_original/main/bt_app_hf.c	2026-08-30 21:55:50.000000000 +0000
++++ /mnt/data/ava_louder_src/main/bt_app_hf.c	2026-08-31 19:19:15.127068374 +0000
+@@ -52,12 +52,6 @@
+ static uint8_t audio_retry_count = 0;
+ #define MAX_AUDIO_RETRIES 3
+ 
+-// Codec negotiation tracking to prevent infinite loops
+-static uint32_t codec_negotiation_count = 0;
+-static TickType_t last_codec_negotiation_time = 0;
+-#define MAX_CODEC_NEGOTIATIONS 20  // Stop after 20 attempts
+-#define CODEC_NEGOTIATION_TIMEOUT_MS 10000  // Reset counter after 10 seconds
+-
+ // Last negotiated HFP codec (ESP_HF_WBS_NONE/NO/YES).
+ // mSBC/WBS is preferred for best HFP speech quality; CVSD remains the
+ // standards-compliant fallback when the headset cannot negotiate WBS.
+@@ -820,7 +814,7 @@
+         }
+         
+         // Convert 16-bit to 32-bit and duplicate for stereo (L+R channels)
+-        int32_t sample_32 = ((int32_t)sample) << 16; // Scale to 32-bit
++        int32_t sample_32 = (int32_t)sample * 65536; // Scale to 32-bit without signed-shift UB
+         output[i * 2] = sample_32;     // Left channel
+         output[i * 2 + 1] = sample_32; // Right channel
+     }
+@@ -1222,7 +1216,6 @@
+             esp_bt_gap_cancel_discovery();
+             audio_retry_count = 0;
+             audio_connect_requested = false;
+-            codec_negotiation_count = 0;
+             negotiated_mode = ESP_HF_WBS_NONE;
+             hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
+             connection_jingle_pending = true;
+diff -ruN /mnt/data/ava_louder_original/main/cm108b_mixer_integration.patch /mnt/data/ava_louder_src/main/cm108b_mixer_integration.patch
+--- /mnt/data/ava_louder_original/main/cm108b_mixer_integration.patch	2026-08-31 21:10:32.000000000 +0000
++++ /mnt/data/ava_louder_src/main/cm108b_mixer_integration.patch	1970-01-01 00:00:00.000000000 +0000
+@@ -1,131 +0,0 @@
+-diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+---- a/main/CMakeLists.txt
+-+++ b/main/CMakeLists.txt
+-@@
+-         "volume_control.c"
+-         "louder_tas5805m.c"
+-+        "audio_mixer.c"
+-         "main.c"
+-         "bt_app_hf.c"
+-
+-diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+---- a/main/Kconfig.projbuild
+-+++ b/main/Kconfig.projbuild
+-@@
+-     menu "Louder ESP32 Rev H6 audio hardware"
+-@@
+-     endmenu
+-+
+-+    menu "CM108B USB audio input / mixer"
+-+
+-+        config CM108B_BCLK_GPIO
+-+            int "CM108B DASCLK / BCLK GPIO"
+-+            default 18
+-+
+-+        config CM108B_LRCLK_GPIO
+-+            int "CM108B DALRCK / LRCLK GPIO"
+-+            default 19
+-+
+-+        config CM108B_DATA_GPIO
+-+            int "CM108B SDOUT / DATA GPIO"
+-+            default 23
+-+
+-+        config AUDIO_MIX_USB_GAIN_PERCENT
+-+            int "USB audio mixer gain (%)"
+-+            range 0 100
+-+            default 70
+-+
+-+        config AUDIO_MIX_HFP_GAIN_PERCENT
+-+            int "HFP microphone mixer gain (%)"
+-+            range 0 100
+-+            default 70
+-+
+-+    endmenu
+-
+-diff --git a/main/bt_app_hf.c b/main/bt_app_hf.c
+---- a/main/bt_app_hf.c
+-+++ b/main/bt_app_hf.c
+-@@
+- #include "bt_app_hf.h"
+- #include "volume_control.h"
+- #include "louder_tas5805m.h"
+-+#include "audio_mixer.h"
+-@@
+--#define SAMPLE_RATE 44100  // Audio sample rate for Louder H6 / TAS5805M
+-+#define SAMPLE_RATE 48000  // Common mixer/output sample rate
+-@@
+--// Resample Function (Linear Interpolation) - HFP mono to TAS5805M stereo
+--void resample_linear_stereo(const int16_t *input, int input_size, int32_t *output, int *output_size)
+--{
+--    float ratio = 44100.0 / 16000.0; // 2.75625
+--    int output_samples = (int)(input_size * ratio);
+--
+--    for (int i = 0; i < output_samples; i++)
+--    {
+--        float src_index = i / ratio;
+--        int index = (int)src_index;
+--        float fraction = src_index - index;
+--
+--        int16_t sample1 = input[index];
+--        int16_t sample2 = (index + 1 < input_size) ? input[index + 1] : sample1;
+--        int16_t interpolated = sample1 + (int16_t)((sample2 - sample1) * fraction);
+--
+--        output[i * 2] = ((int32_t)interpolated) << 16;
+--        output[i * 2 + 1] = ((int32_t)interpolated) << 16;
+--    }
+--
+--    *output_size = output_samples * 2;
+--}
+--
+--// Bluetooth Incoming Audio Callback Function - TAS5805M stereo output
+-+// Bluetooth Incoming Audio Callback.
+-+// IMPORTANT: Never block and never write I2S here. The low-latency mixer owns
+-+// the only TAS5805M TX stream.
+- void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
+- {
+--    const int16_t *input = (const int16_t *)buf;
+--    int input_size = sz / 2; // Convert bytes to samples
+--
+--    static int32_t resampled_buffer[BUFFER_SIZE * 6]; // Larger buffer for 32-bit stereo
+--    int output_size;
+--
+--    resample_linear_stereo(input, input_size, resampled_buffer, &output_size);
+--
+--    size_t bytes_written;
+--    i2s_channel_write(tx_chan, resampled_buffer, output_size * 4,
+--                      &bytes_written, portMAX_DELAY);
+-+    audio_mixer_push_hfp(buf, sz);
+-
+- #if CONFIG_ENABLE_SD_RECORDING
+-     if (sdcard_initialized && record_file)
+-@@
+-     esp_err_t amp_ret = louder_tas5805m_start();
+-     if (amp_ret != ESP_OK) {
+-@@
+-         return amp_ret;
+-     }
+-+
+-+    /*
+-+     * Start CM108B RX + software mixer only after TAS5805M TX is enabled.
+-+     * GPIO18 = DASCLK/BCLK, GPIO19 = DALRCK/LRCLK, GPIO23 = SDOUT.
+-+     */
+-+    ret = audio_mixer_start(tx_chan);
+-+    if (ret != ESP_OK) {
+-+        ESP_LOGE("AUDIO", "CM108B/HFP mixer failed to start: %s",
+-+                 esp_err_to_name(ret));
+-+        louder_tas5805m_stop();
+-+        if (i2s_enabled) {
+-+            i2s_channel_disable(tx_chan);
+-+            i2s_enabled = false;
+-+        }
+-+        return ret;
+-+    }
+-@@
+- void bt_app_stop_audio(void)
+- {
+-     ESP_LOGI("AUDIO", "Shutting down audio...");
+-+
+-+    // Stop mixer first: it owns I2S1 RX and writes to I2S0 TX.
+-+    audio_mixer_stop();
+-
+-     // Put the TAS5805M in Hi-Z/PWDN while I2S clocks are still available.

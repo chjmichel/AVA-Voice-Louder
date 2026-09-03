@@ -286,6 +286,17 @@ void app_main(void)
             ESP_LOGW(TAG, "Failed to start volume monitoring: %s", esp_err_to_name(ret));
         }
     }
+
+    /*
+     * Start the local audio engine independently of Bluetooth/HFP.
+     * Samsung -> CM108B audio must work even with no headset connected.
+     */
+    ESP_LOGI(TAG, "Starting central audio engine (CM108B + mixer + TAS5805M)...");
+    ret = bt_app_audio_engine_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start central audio engine: %s", esp_err_to_name(ret));
+        return;
+    }
     
     ESP_LOGI(TAG, "Starting Bluetooth discovery...");
     ret = bt_app_hf_start();

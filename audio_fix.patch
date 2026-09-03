@@ -1,0 +1,270 @@
+--- /mnt/data/ava_louder_src/main/audio_mixer.c	2026-08-31 19:19:00.336733584 +0000
++++ /mnt/data/ava_fixed_hfp_independent/main/audio_mixer.c	2026-08-31 19:46:49.326363052 +0000
+@@ -18,6 +18,7 @@
+ #define MIX_CHANNELS               2U
+ #define MIX_BYTES_32               (MIX_FRAMES * MIX_CHANNELS * sizeof(int32_t))
+ #define USB_BYTES_16               (MIX_FRAMES * MIX_CHANNELS * sizeof(int16_t))
++#define AUDIO_MIXER_TASK_STACK_BYTES 6144U
+ 
+ /* Bounded producer FIFOs. HFP stays intentionally small to avoid audible echo. */
+ #define HFP_FIFO_BYTES             (MIX_BYTES_32 * 4U)   /* ~20 ms */
+@@ -57,6 +58,17 @@
+ static uint32_t s_hfp_drop_chunks = 0U;
+ static uint32_t s_usb_empty_blocks = 0U;
+ static uint32_t s_usb_partial_blocks = 0U;
++static volatile bool s_hfp_flush_requested = false;
++
++/*
++ * Keep the large 5 ms audio blocks out of the FreeRTOS task stack.
++ * Together these buffers use about 6.7 KiB, which is larger than the old
++ * 4096-byte mixer stack and caused the observed stack overflow.
++ */
++static int16_t s_usb_block[MIX_FRAMES * MIX_CHANNELS];
++static int32_t s_hfp_block[MIX_FRAMES * MIX_CHANNELS];
++static int32_t s_jingle_block[MIX_FRAMES * MIX_CHANNELS];
++static int32_t s_output_block[MIX_FRAMES * MIX_CHANNELS];
+ 
+ static int32_t clamp_i32(int64_t value)
+ {
+@@ -153,6 +165,16 @@
+     s_jingle_active = active;
+ }
+ 
++void audio_mixer_clear_hfp(void)
++{
++    /*
++     * Do not reset the StreamBuffer directly from the Bluetooth callback while
++     * the mixer task may be receiving from it. Request a consumer-side flush
++     * instead. The mixer performs the actual drain on its next 5 ms cycle.
++     */
++    s_hfp_flush_requested = true;
++}
++
+ esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks)
+ {
+     if (!s_running || s_jingle_fifo == NULL) {
+@@ -193,11 +215,6 @@
+ {
+     (void)arg;
+ 
+-    int16_t usb[MIX_FRAMES * MIX_CHANNELS];
+-    int32_t hfp[MIX_FRAMES * MIX_CHANNELS];
+-    int32_t jingle[MIX_FRAMES * MIX_CHANNELS];
+-    int32_t out[MIX_FRAMES * MIX_CHANNELS];
+-
+     ESP_LOGI(TAG,
+              "Central mixer started: CM108B I2S1 RX slave BCLK=%d LRCLK=%d DATA=%d; "
+              "USB + HFP + jingle -> 48 kHz TAS5805M",
+@@ -206,7 +223,7 @@
+              CONFIG_CM108B_DATA_GPIO);
+ 
+     while (s_running) {
+-        memset(usb, 0, sizeof(usb));
++        memset(s_usb_block, 0, sizeof(s_usb_block));
+ 
+         /*
+          * Never pace the output from the CM108B clock. The CM108B may stop its
+@@ -215,20 +232,28 @@
+          */
+         size_t usb_got = 0U;
+         const esp_err_t usb_ret = i2s_channel_read(s_rx_chan,
+-                                                   usb,
+-                                                   sizeof(usb),
++                                                   s_usb_block,
++                                                   sizeof(s_usb_block),
+                                                    &usb_got,
+                                                    0);
+         if (usb_ret != ESP_OK || usb_got == 0U) {
+             ++s_usb_empty_blocks;
+             usb_got = 0U;
+-        } else if (usb_got < sizeof(usb)) {
+-            memset(((uint8_t *)usb) + usb_got, 0, sizeof(usb) - usb_got);
++        } else if (usb_got < sizeof(s_usb_block)) {
++            memset(((uint8_t *)s_usb_block) + usb_got, 0, sizeof(s_usb_block) - usb_got);
+             ++s_usb_partial_blocks;
+         }
+ 
+-        receive_source(s_hfp_fifo, hfp, sizeof(hfp));
+-        receive_source(s_jingle_fifo, jingle, sizeof(jingle));
++        if (s_hfp_flush_requested) {
++            uint8_t discard[128];
++            while (xStreamBufferReceive(s_hfp_fifo, discard, sizeof(discard), 0) != 0U) {
++                /* drain stale HFP PCM */
++            }
++            s_hfp_flush_requested = false;
++        }
++
++        receive_source(s_hfp_fifo, s_hfp_block, sizeof(s_hfp_block));
++        receive_source(s_jingle_fifo, s_jingle_block, sizeof(s_jingle_block));
+ 
+         const int source_duck = s_jingle_active
+                                     ? CONFIG_AUDIO_MIX_JINGLE_DUCK_PERCENT
+@@ -236,20 +261,20 @@
+ 
+         for (size_t i = 0U; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
+             /* CM108B 16-bit PCM -> TAS5805M's 32-bit I2S sample domain. */
+-            const int32_t usb32 = (int32_t)usb[i] * 65536;
++            const int32_t usb32 = (int32_t)s_usb_block[i] * 65536;
+ 
+             int64_t mixed = 0;
+             mixed += ((int64_t)usb32 * CONFIG_AUDIO_MIX_USB_GAIN_PERCENT * source_duck) / 10000;
+-            mixed += ((int64_t)hfp[i] * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT * source_duck) / 10000;
+-            mixed += ((int64_t)jingle[i] * CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT) / 100;
++            mixed += ((int64_t)s_hfp_block[i] * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT * source_duck) / 10000;
++            mixed += ((int64_t)s_jingle_block[i] * CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT) / 100;
+ 
+-            out[i] = clamp_i32(mixed);
++            s_output_block[i] = clamp_i32(mixed);
+         }
+ 
+         size_t written = 0U;
+         const esp_err_t tx_ret = i2s_channel_write(s_tx_chan,
+-                                                   out,
+-                                                   sizeof(out),
++                                                   s_output_block,
++                                                   sizeof(s_output_block),
+                                                    &written,
+                                                    pdMS_TO_TICKS(20));
+         if (tx_ret != ESP_OK && s_running) {
+@@ -282,6 +307,7 @@
+     s_usb_empty_blocks = 0U;
+     s_usb_partial_blocks = 0U;
+     s_jingle_active = false;
++    s_hfp_flush_requested = false;
+ 
+     if (s_hfp_fifo == NULL) {
+         s_hfp_fifo = xStreamBufferCreate(HFP_FIFO_BYTES, 1);
+@@ -353,7 +379,7 @@
+ 
+     const BaseType_t task_ret = xTaskCreatePinnedToCore(mixer_task,
+                                                         "audio_mixer",
+-                                                        4096,
++                                                        AUDIO_MIXER_TASK_STACK_BYTES,
+                                                         NULL,
+                                                         20,
+                                                         &s_mixer_task,
+--- /mnt/data/ava_louder_src/main/audio_mixer.h	2026-08-31 19:19:00.335844650 +0000
++++ /mnt/data/ava_fixed_hfp_independent/main/audio_mixer.h	2026-08-31 19:47:08.603798087 +0000
+@@ -60,6 +60,12 @@
+ /** Mark whether a local jingle is active (used for source ducking). */
+ void audio_mixer_set_jingle_active(bool active);
+ 
++/**
++ * Drop any queued HFP PCM without stopping the central audio engine.
++ * CM108B USB audio and TAS5805M output continue running.
++ */
++void audio_mixer_clear_hfp(void);
++
+ /** Wait until all queued jingle PCM has been consumed by the mixer. */
+ esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks);
+ 
+--- /mnt/data/ava_louder_src/main/bt_app_hf.c	2026-08-31 19:19:15.127068374 +0000
++++ /mnt/data/ava_fixed_hfp_independent/main/bt_app_hf.c	2026-08-31 19:47:56.293059891 +0000
+@@ -1029,7 +1029,7 @@
+ }
+ 
+ // Stop Recording & Audio Playback
+-void bt_app_send_data_shut_down(void)
++static void bt_app_send_data_shut_down(void)
+ {
+     ESP_LOGI("AUDIO", "Shutting down audio...");
+ 
+@@ -1096,6 +1096,22 @@
+ 
+ #endif /* #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI */
+ 
++esp_err_t bt_app_audio_engine_start(void)
++{
++#if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
++    return bt_app_send_data();
++#else
++    return ESP_ERR_NOT_SUPPORTED;
++#endif
++}
++
++void bt_app_audio_engine_stop(void)
++{
++#if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
++    bt_app_send_data_shut_down();
++#endif
++}
++
+ const char *c_hf_evt_str[] = {
+     "CONNECTION_STATE_EVT", /*!< SERVICE LEVEL CONNECTION STATE CONTROL */
+     "AUDIO_STATE_EVT",      /*!< AUDIO CONNECTION STATE CONTROL */
+@@ -1237,7 +1253,8 @@
+             trying_saved_mac = false;
+ 
+ #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
+-            bt_app_send_data_shut_down();
++            /* HFP is only one mixer source. Keep CM108B/TAS5805M running. */
++            audio_mixer_clear_hfp();
+ #endif
+ 
+             is_connected = false;
+@@ -1287,7 +1304,10 @@
+             
+ #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
+             ESP_LOGI(TAG, "Microphone audio will now stream to Louder H6");
++            audio_mixer_clear_hfp();
+             
++            // The local audio engine normally starts at boot. Keep this
++            // idempotent call as a recovery path if startup had failed.
+             // Initialize I2S first, then configure the TAS5805M DSP while the
+             // I2S clocks are already stable. Do not accept PCM callbacks if the
+             // amplifier setup failed.
+@@ -1326,8 +1346,11 @@
+             ESP_LOGW(TAG, "Audio disconnected (attempt %d/%d)", audio_retry_count, MAX_AUDIO_RETRIES);
+             
+ #if CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI
+-            // Shutdown I2S and SD card recording
+-            bt_app_send_data_shut_down();
++            /*
++             * Do NOT stop I2S, TAS5805M or CM108B here. The SCO/HFP transport
++             * is optional; Samsung USB audio must continue independently.
++             */
++            audio_mixer_clear_hfp();
+ #endif
+             
+             // Reset the connect requested flag to allow retry
+--- /mnt/data/ava_louder_src/main/bt_app_hf.h	2026-08-30 18:31:10.000000000 +0000
++++ /mnt/data/ava_fixed_hfp_independent/main/bt_app_hf.h	2026-08-31 19:47:08.603943075 +0000
+@@ -38,6 +38,18 @@
+ esp_err_t bt_app_hf_start(void);
+ 
+ /**
++ * @brief Start the local audio engine independently of HFP.
++ *
++ * Starts I2S0 TX, TAS5805M, CM108B I2S1 RX and the central mixer.
++ */
++esp_err_t bt_app_audio_engine_start(void);
++
++/**
++ * @brief Stop the complete local audio engine (system shutdown only).
++ */
++void bt_app_audio_engine_stop(void);
++
++/**
+  * @brief HFP AG callback function
+  */
+ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param);
+--- /mnt/data/ava_louder_src/main/main.c	2026-08-30 18:31:12.000000000 +0000
++++ /mnt/data/ava_fixed_hfp_independent/main/main.c	2026-08-31 19:47:08.604431198 +0000
+@@ -286,6 +286,17 @@
+             ESP_LOGW(TAG, "Failed to start volume monitoring: %s", esp_err_to_name(ret));
+         }
+     }
++
++    /*
++     * Start the local audio engine independently of Bluetooth/HFP.
++     * Samsung -> CM108B audio must work even with no headset connected.
++     */
++    ESP_LOGI(TAG, "Starting central audio engine (CM108B + mixer + TAS5805M)...");
++    ret = bt_app_audio_engine_start();
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Failed to start central audio engine: %s", esp_err_to_name(ret));
++        return;
++    }
+     
+     ESP_LOGI(TAG, "Starting Bluetooth discovery...");
+     ret = bt_app_hf_start();

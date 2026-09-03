@@ -38,6 +38,18 @@ esp_err_t bt_app_hf_init(const char *target_device_name);
 esp_err_t bt_app_hf_start(void);
 
 /**
+ * @brief Start the local audio engine independently of HFP.
+ *
+ * Starts I2S0 TX, TAS5805M, CM108B I2S1 RX and the central mixer.
+ */
+esp_err_t bt_app_audio_engine_start(void);
+
+/**
+ * @brief Stop the complete local audio engine (system shutdown only).
+ */
+void bt_app_audio_engine_stop(void);
+
+/**
  * @brief HFP AG callback function
  */
 void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param);

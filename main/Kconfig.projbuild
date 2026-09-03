@@ -72,6 +72,85 @@ menu "AVA Voice / Louder ESP32 Rev H6"
 
     endmenu
 
+    menu "CM108B USB audio input / central mixer"
+
+        config CM108B_BCLK_GPIO
+            int "CM108B DASCLK/BCLK GPIO"
+            default 18
+            help
+                CM108B I2S bit clock output. Connect DASCLK to ESP32 GPIO18.
+
+        config CM108B_LRCLK_GPIO
+            int "CM108B DALRCK/LRCLK GPIO"
+            default 19
+            help
+                CM108B I2S word-select output. Connect DALRCK to ESP32 GPIO19.
+
+        config CM108B_DATA_GPIO
+            int "CM108B SDOUT/DATA GPIO"
+            default 23
+            help
+                CM108B I2S playback data output. Connect SDOUT to ESP32 GPIO23.
+
+        config CM108B_DIAG_RX_STATS
+            bool "Log CM108B RX transport statistics"
+            default y
+            help
+                Logs complete 5 ms RX blocks, partial driver reads, timeouts,
+                I2S errors, incomplete blocks, FIFO drops and mixer underflows
+                every 2 seconds, including windows where no DMA block arrives.
+
+        config CM108B_DIAG_CLOCK_PROBE
+            bool "Measure CM108B DASCLK and DALRCK with ESP32 PCNT"
+            default y
+            help
+                Uses two ESP32 pulse-counter units to measure GPIO18/DASCLK and
+                GPIO19/DALRCK without an oscilloscope. Expected during 48 kHz
+                playback: about 3.072 MHz DASCLK and 48 kHz DALRCK (ratio ~64).
+
+        config CM108B_RAW_USE_LOWER16
+            bool "Use lower 16 bits of each raw 32-bit CM108B slot"
+            default n
+            help
+                Diagnostic option. Default extracts the upper 16 bits [31:16].
+                Enable only if RAW peak/sample logs show PCM is in [15:0].
+
+        config CM108B_DIAG_1KHZ_TONE
+            bool "Replace CM108B audio with internal 1 kHz diagnostic tone"
+            default n
+            help
+                Replaces only the USB/CM108B mixer source with a locally generated
+                1 kHz sine. If this tone is clean, I2S0/TAS5805M/speaker are good
+                and distortion is confirmed to be on the CM108B I2S1 RX side.
+
+        config AUDIO_MIX_USB_GAIN_PERCENT
+            int "Samsung/CM108B mixer gain (%)"
+            range 0 100
+            default 70
+            help
+                Gain applied to USB audio before mixing.
+
+        config AUDIO_MIX_HFP_GAIN_PERCENT
+            int "HFP microphone mixer gain (%)"
+            range 0 100
+            default 100
+            help
+                Gain applied to the resampled headset microphone before mixing.
+
+        config AUDIO_MIX_JINGLE_GAIN_PERCENT
+            int "AVA jingle mixer gain (%)"
+            range 0 100
+            default 100
+
+        config AUDIO_MIX_JINGLE_DUCK_PERCENT
+            int "USB/HFP level while AVA jingle plays (%)"
+            range 0 100
+            default 0
+            help
+                0 mutes USB/HFP while the connection jingle is active.
+
+    endmenu
+
     menu "Potentiometer volume control"
 
         config VOLUME_POT_GPIO
