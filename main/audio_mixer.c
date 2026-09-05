@@ -32,7 +32,7 @@ static const char *TAG = "AUDIO_MIXER";
 #define USB_FIFO_BYTES             (MIX_BYTES_32 * USB_FIFO_BLOCKS)
 
 /* Bounded producer FIFOs. HFP stays intentionally small to avoid audible echo. */
-#define HFP_FIFO_BYTES             (MIX_BYTES_32 * 4U)   /* ~20 ms */
+#define HFP_FIFO_BYTES             (MIX_BYTES_32 * 2U)   /* ~10 ms */
 #define JINGLE_FIFO_BYTES          (MIX_BYTES_32 * 12U)  /* ~60 ms */
 
 #ifndef CONFIG_CM108B_BCLK_GPIO
@@ -49,6 +49,9 @@ static const char *TAG = "AUDIO_MIXER";
 #endif
 #ifndef CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT
 #define CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT 100
+#endif
+#ifndef CONFIG_HFP_MIC_DEFAULT_GAIN
+#define CONFIG_HFP_MIC_DEFAULT_GAIN 10
 #endif
 #ifndef CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT
 #define CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT 100
@@ -85,6 +88,7 @@ static volatile bool s_running = false;
 static volatile bool s_jingle_active = false;
 
 static uint32_t s_hfp_drop_chunks = 0U;
+static uint32_t s_hfp_latency_flushes = 0U;
 static uint32_t s_usb_rx_full_blocks = 0U;
 static uint32_t s_usb_rx_partial_reads = 0U;
 static uint32_t s_usb_rx_timeout_count = 0U;
@@ -96,6 +100,33 @@ static uint32_t s_usb_underflows = 0U;
 static uint32_t s_tx_timeout_count = 0U;
 static volatile bool s_usb_streaming = false;
 static volatile bool s_hfp_flush_requested = false;
+
+/*
+ * HFP microphone gain follows the HFP VGM range 0..15. VGM 10 deliberately
+ * equals the existing mixer level (1.0x), so the new control is neutral at
+ * the requested default. Values above 10 provide headroom up to 2.0x at 15.
+ * The Q15-style table is read once per 5 ms mixer block; the 32-bit value is
+ * atomic on ESP32 and can safely be updated from the Bluetooth callback.
+ */
+static volatile int s_hfp_mic_gain = CONFIG_HFP_MIC_DEFAULT_GAIN;
+static const int32_t s_hfp_mic_gain_q15[16] = {
+        0,  /*  0 = mute */
+     3277,  /*  1 = 0.10x */
+     6554,  /*  2 = 0.20x */
+     9830,  /*  3 = 0.30x */
+    13107,  /*  4 = 0.40x */
+    16384,  /*  5 = 0.50x */
+    19661,  /*  6 = 0.60x */
+    22938,  /*  7 = 0.70x */
+    26214,  /*  8 = 0.80x */
+    29491,  /*  9 = 0.90x */
+    32768,  /* 10 = 1.00x / nominal */
+    36864,  /* 11 = 1.125x */
+    40960,  /* 12 = 1.25x */
+    45056,  /* 13 = 1.375x */
+    52429,  /* 14 = 1.60x */
+    65536   /* 15 = 2.00x / about +6 dB */
+};
 
 /*
  * Keep the large 5 ms audio blocks out of the FreeRTOS task stack.
@@ -415,10 +446,18 @@ esp_err_t audio_mixer_submit_hfp(const int32_t *stereo_pcm, size_t frames)
 
     const esp_err_t ret = stream_send_complete(s_hfp_fifo, stereo_pcm, bytes, 0);
     if (ret == ESP_ERR_TIMEOUT) {
+        /*
+         * HFP is live microphone monitoring. Once PCM is late, keeping it only
+         * increases the audible voice delay. Keep this Bluetooth callback
+         * non-blocking and ask the mixer (the StreamBuffer consumer) to discard
+         * queued stale HFP PCM on its next 5 ms cycle.
+         */
+        s_hfp_flush_requested = true;
         ++s_hfp_drop_chunks;
-        if ((s_hfp_drop_chunks % 100U) == 0U) {
+        if (s_hfp_drop_chunks == 1U || (s_hfp_drop_chunks % 100U) == 0U) {
             ESP_LOGW(TAG,
-                     "HFP mixer FIFO full; dropped newest chunk (drops=%lu)",
+                     "HFP FIFO full; dropped current chunk and requested stale-audio flush "
+                     "(drops=%lu)",
                      (unsigned long)s_hfp_drop_chunks);
         }
     }
@@ -457,6 +496,29 @@ void audio_mixer_clear_hfp(void)
      * instead. The mixer performs the actual drain on its next 5 ms cycle.
      */
     s_hfp_flush_requested = true;
+}
+
+void audio_mixer_set_hfp_mic_gain(int gain)
+{
+    if (gain < 0) {
+        gain = 0;
+    } else if (gain > 15) {
+        gain = 15;
+    }
+
+    s_hfp_mic_gain = gain;
+
+    const int32_t factor_q15 = s_hfp_mic_gain_q15[gain];
+    const int factor_percent = (int)(((int64_t)factor_q15 * 100 + 16384) / 32768);
+    ESP_LOGI(TAG,
+             "HFP microphone mixer gain: level=%d/15, factor=%d%% (level 10=100%%)",
+             gain,
+             factor_percent);
+}
+
+int audio_mixer_get_hfp_mic_gain(void)
+{
+    return s_hfp_mic_gain;
 }
 
 esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks)
@@ -734,11 +796,34 @@ static void mixer_task(void *arg)
 #endif
 
         if (s_hfp_flush_requested) {
+            /*
+             * Consumer-side latency recovery. Do not reset/read the HFP
+             * StreamBuffer from the Bluetooth producer callback: FreeRTOS
+             * StreamBuffer is kept in its intended single-producer /
+             * single-consumer model.
+             */
             uint8_t discard[128];
-            while (xStreamBufferReceive(s_hfp_fifo, discard, sizeof(discard), 0) != 0U) {
-                /* drain stale HFP PCM */
-            }
+            size_t discarded_bytes = 0U;
+            size_t discarded_now = 0U;
+            do {
+                discarded_now = xStreamBufferReceive(s_hfp_fifo,
+                                                      discard,
+                                                      sizeof(discard),
+                                                      0);
+                discarded_bytes += discarded_now;
+            } while (discarded_now != 0U);
+
             s_hfp_flush_requested = false;
+            ++s_hfp_latency_flushes;
+
+            if (s_hfp_latency_flushes == 1U ||
+                (s_hfp_latency_flushes % 25U) == 0U) {
+                ESP_LOGW(TAG,
+                         "HFP stale audio flushed for low latency "
+                         "(bytes=%u, flushes=%lu)",
+                         (unsigned)discarded_bytes,
+                         (unsigned long)s_hfp_latency_flushes);
+            }
         }
 
         receive_source(s_hfp_fifo, s_hfp_block, sizeof(s_hfp_block));
@@ -748,6 +833,14 @@ static void mixer_task(void *arg)
                                     ? CONFIG_AUDIO_MIX_JINGLE_DUCK_PERCENT
                                     : 100;
 
+        int hfp_vgm = s_hfp_mic_gain;
+        if (hfp_vgm < 0) {
+            hfp_vgm = 0;
+        } else if (hfp_vgm > 15) {
+            hfp_vgm = 15;
+        }
+        const int32_t hfp_gain_q15 = s_hfp_mic_gain_q15[hfp_vgm];
+
         for (size_t i = 0U; i < MIX_FRAMES * MIX_CHANNELS; ++i) {
             /* CM108B int16_t PCM was promoted to the common 32-bit
              * full-scale mixer domain by usb_rx_task(). */
@@ -755,7 +848,8 @@ static void mixer_task(void *arg)
 
             int64_t mixed = 0;
             mixed += ((int64_t)usb32 * CONFIG_AUDIO_MIX_USB_GAIN_PERCENT * source_duck) / 10000;
-            mixed += ((int64_t)s_hfp_block[i] * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT * source_duck) / 10000;
+            mixed += ((int64_t)s_hfp_block[i] * CONFIG_AUDIO_MIX_HFP_GAIN_PERCENT *
+                      source_duck * hfp_gain_q15) / (10000LL * 32768LL);
             mixed += ((int64_t)s_jingle_block[i] * CONFIG_AUDIO_MIX_JINGLE_GAIN_PERCENT) / 100;
 
             s_output_block[i] = clamp_i32(mixed);
@@ -799,10 +893,12 @@ static void mixer_task(void *arg)
     }
 
     ESP_LOGI(TAG,
-             "Central mixer stopped (HFP drops=%lu; CM108B full=%lu partial_reads=%lu "
+             "Central mixer stopped (HFP drops=%lu latency_flushes=%lu; "
+             "CM108B full=%lu partial_reads=%lu "
              "timeouts=%lu errors=%lu incomplete=%lu fifo_drops=%lu fifo_partial=%lu "
              "underflows=%lu; TX timeouts=%lu)",
              (unsigned long)s_hfp_drop_chunks,
+             (unsigned long)s_hfp_latency_flushes,
              (unsigned long)s_usb_rx_full_blocks,
              (unsigned long)s_usb_rx_partial_reads,
              (unsigned long)s_usb_rx_timeout_count,
@@ -828,6 +924,7 @@ esp_err_t audio_mixer_start(i2s_chan_handle_t tx_chan)
 
     s_tx_chan = tx_chan;
     s_hfp_drop_chunks = 0U;
+    s_hfp_latency_flushes = 0U;
     s_usb_rx_full_blocks = 0U;
     s_usb_rx_partial_reads = 0U;
     s_usb_rx_timeout_count = 0U;
@@ -840,6 +937,7 @@ esp_err_t audio_mixer_start(i2s_chan_handle_t tx_chan)
     s_usb_streaming = false;
     s_jingle_active = false;
     s_hfp_flush_requested = false;
+    audio_mixer_set_hfp_mic_gain(CONFIG_HFP_MIC_DEFAULT_GAIN);
 
     if (s_usb_fifo == NULL) {
         s_usb_fifo = xStreamBufferCreate(USB_FIFO_BYTES, 1);

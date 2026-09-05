@@ -67,6 +67,20 @@ void audio_mixer_set_jingle_active(bool active);
  */
 void audio_mixer_clear_hfp(void);
 
+/**
+ * Set the HFP headset microphone mixer gain. The HFP AG maps both incoming
+ * AT+VGM and AT+VGS volume controls to this level for AVA.
+ *
+ * Range: 0..15. Gain 10 is the nominal 1.0 mixer level, gain 0 mutes the
+ * HFP source, and gain 15 provides approximately +6 dB (2.0x) boost.
+ * This affects only the HFP microphone source; USB/CM108B and jingle levels
+ * remain unchanged.
+ */
+void audio_mixer_set_hfp_mic_gain(int gain);
+
+/** Return the currently active HFP microphone gain (0..15). */
+int audio_mixer_get_hfp_mic_gain(void);
+
 /** Wait until all queued jingle PCM has been consumed by the mixer. */
 esp_err_t audio_mixer_wait_jingle_drained(TickType_t timeout_ticks);
 

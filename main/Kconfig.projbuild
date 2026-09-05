@@ -6,6 +6,15 @@ menu "AVA Voice / Louder ESP32 Rev H6"
         help
             Bluetooth headset name to search and connect automatically.
 
+    config HFP_MIC_DEFAULT_GAIN
+        int "Default HFP microphone gain (VGM)"
+        range 0 15
+        default 10
+        help
+            Initial HFP microphone gain after the Service Level Connection is
+            established. The headset can subsequently change this value with
+            AT+VGM (range 0..15). Gain 10 keeps the existing HFP mixer level.
+
     menu "Louder ESP32 Rev H6 audio hardware"
 
         config I2S_BCLK_GPIO

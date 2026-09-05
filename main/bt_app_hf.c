@@ -24,6 +24,10 @@ static const char *TAG = "BT_HF";
 
 #define RESET_HOLD_TIME_MS 5000  // 5 seconds
 
+#ifndef CONFIG_HFP_MIC_DEFAULT_GAIN
+#define CONFIG_HFP_MIC_DEFAULT_GAIN 10
+#endif
+
 #if CONFIG_ENABLE_HEADSET_RESET_GPIO
 #define RESET_GPIO_PIN ((gpio_num_t)CONFIG_HEADSET_RESET_GPIO)
 #if CONFIG_HEADSET_RESET_ACTIVE_HIGH
@@ -64,6 +68,17 @@ static volatile uint32_t hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
 // A SCO retry within the same SLC session must not replay the brand song.
 static bool connection_jingle_pending = false;
 
+/*
+ * During SLC setup many headsets first report their previously stored HFP
+ * volume values. Keep the requested AVA microphone default authoritative
+ * until the delayed audio setup reasserts VGM=CONFIG_HFP_MIC_DEFAULT_GAIN.
+ * Afterwards BOTH AT+VGM and AT+VGS received from the headset control the
+ * HFP microphone level in the central mixer. This is intentional for headsets
+ * whose physical Volume +/- buttons report speaker gain (VGS) rather than
+ * microphone gain (VGM), e.g. the Open Ear Air X3 used with AVA.
+ */
+static bool hfp_mic_gain_control_ready = false;
+
 static const char *bt_app_hfp_codec_name(esp_hf_wbs_config_t mode)
 {
     switch (mode) {
@@ -74,6 +89,178 @@ static const char *bt_app_hfp_codec_name(esp_hf_wbs_config_t mode)
     case ESP_HF_WBS_NONE:
     default:
         return "not negotiated";
+    }
+}
+
+
+/*
+ * HFP control-plane diagnostics for ESP-IDF v5.3.1.
+ *
+ * This deliberately runs before the normal event handler and has no side
+ * effects. It makes every HFP AG callback visible so we can determine which
+ * Bluetooth/HFP command the headset sends for its physical buttons.
+ */
+static const char *bt_app_hfp_event_name(esp_hf_cb_event_t event)
+{
+    switch (event) {
+    case ESP_HF_CONNECTION_STATE_EVT:      return "CONNECTION_STATE";
+    case ESP_HF_AUDIO_STATE_EVT:           return "AUDIO_STATE";
+    case ESP_HF_BVRA_RESPONSE_EVT:         return "BVRA_RESPONSE";
+    case ESP_HF_VOLUME_CONTROL_EVT:        return "VOLUME_CONTROL";
+    case ESP_HF_UNAT_RESPONSE_EVT:         return "UNKNOWN_AT";
+    case ESP_HF_IND_UPDATE_EVT:            return "IND_UPDATE";
+    case ESP_HF_CIND_RESPONSE_EVT:         return "CIND_RESPONSE";
+    case ESP_HF_COPS_RESPONSE_EVT:         return "COPS_RESPONSE";
+    case ESP_HF_CLCC_RESPONSE_EVT:         return "CLCC_RESPONSE";
+    case ESP_HF_CNUM_RESPONSE_EVT:         return "CNUM_RESPONSE";
+    case ESP_HF_VTS_RESPONSE_EVT:          return "VTS_RESPONSE";
+    case ESP_HF_NREC_RESPONSE_EVT:         return "NREC_RESPONSE";
+    case ESP_HF_ATA_RESPONSE_EVT:          return "ATA_RESPONSE";
+    case ESP_HF_CHUP_RESPONSE_EVT:         return "CHUP_RESPONSE";
+    case ESP_HF_DIAL_EVT:                  return "DIAL";
+    case ESP_HF_WBS_RESPONSE_EVT:          return "WBS_RESPONSE";
+    case ESP_HF_BCS_RESPONSE_EVT:          return "BCS_RESPONSE";
+    case ESP_HF_PKT_STAT_NUMS_GET_EVT:     return "PKT_STAT_NUMS_GET";
+    default:                               return "UNKNOWN_EVENT";
+    }
+}
+
+static void bt_app_hfp_diag_log_event(esp_hf_cb_event_t event,
+                                      const esp_hf_cb_param_t *param)
+{
+    ESP_LOGI(TAG, "HFP_DIAG EVENT: id=%d name=%s",
+             (int)event, bt_app_hfp_event_name(event));
+
+    if (param == NULL) {
+        ESP_LOGW(TAG, "HFP_DIAG: event %d has NULL parameter", (int)event);
+        return;
+    }
+
+    switch (event) {
+    case ESP_HF_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG CONNECTION: state=%d peer_feat=0x%08lx chld_feat=0x%08lx",
+                 (int)param->conn_stat.state,
+                 (unsigned long)param->conn_stat.peer_feat,
+                 (unsigned long)param->conn_stat.chld_feat);
+        break;
+
+    case ESP_HF_AUDIO_STATE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG AUDIO: state=%d sync_conn_handle=0x%04x",
+                 (int)param->audio_stat.state,
+                 (unsigned int)param->audio_stat.sync_conn_handle);
+        break;
+
+    case ESP_HF_BVRA_RESPONSE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG BVRA: voice_recognition=%d",
+                 (int)param->vra_rep.value);
+        break;
+
+    case ESP_HF_VOLUME_CONTROL_EVT: {
+        const int volume = param->volume_control.volume;
+        const char *command = "AT+VG?";
+        const char *target = "UNKNOWN";
+
+        if (param->volume_control.type == ESP_HF_VOLUME_TYPE_MIC) {
+            command = "AT+VGM";
+            target = "MIC";
+        } else if (param->volume_control.type == ESP_HF_VOLUME_TYPE_SPK) {
+            command = "AT+VGS";
+            target = "SPK";
+        }
+
+        ESP_LOGI(TAG,
+                 "HFP_DIAG VOLUME/BUTTON: command=%s value=%d/15 target=%s type=%d",
+                 command,
+                 volume,
+                 target,
+                 (int)param->volume_control.type);
+        break;
+    }
+
+    case ESP_HF_UNAT_RESPONSE_EVT:
+        ESP_LOGW(TAG,
+                 "HFP_DIAG UNKNOWN_AT: raw='%s'",
+                 param->unat_rep.unat ? param->unat_rep.unat : "<null>");
+        break;
+
+    case ESP_HF_IND_UPDATE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG IND_UPDATE: HF indicator update received");
+        break;
+
+    case ESP_HF_CIND_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG CIND: indicator-status request received");
+        break;
+
+    case ESP_HF_COPS_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG COPS: operator request received");
+        break;
+
+    case ESP_HF_CLCC_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG CLCC: current-call-list request received");
+        break;
+
+    case ESP_HF_CNUM_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG CNUM: subscriber-number request received");
+        break;
+
+    case ESP_HF_VTS_RESPONSE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG VTS: DTMF code='%s'",
+                 param->vts_rep.code ? param->vts_rep.code : "<null>");
+        break;
+
+    case ESP_HF_NREC_RESPONSE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG NREC: state=%d",
+                 (int)param->nrec.state);
+        break;
+
+    case ESP_HF_ATA_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG ATA: answer-call command received");
+        break;
+
+    case ESP_HF_CHUP_RESPONSE_EVT:
+        ESP_LOGI(TAG, "HFP_DIAG CHUP: hang-up/reject command received");
+        break;
+
+    case ESP_HF_DIAL_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG DIAL: type=%d number_or_location='%s'",
+                 (int)param->out_call.type,
+                 param->out_call.num_or_loc ? param->out_call.num_or_loc : "<null>");
+        break;
+
+    case ESP_HF_WBS_RESPONSE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG WBS: codec=%d (%s)",
+                 (int)param->wbs_rep.codec,
+                 bt_app_hfp_codec_name(param->wbs_rep.codec));
+        break;
+
+    case ESP_HF_BCS_RESPONSE_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG BCS: final_codec=%d (%s)",
+                 (int)param->bcs_rep.mode,
+                 bt_app_hfp_codec_name(param->bcs_rep.mode));
+        break;
+
+    case ESP_HF_PKT_STAT_NUMS_GET_EVT:
+        ESP_LOGI(TAG,
+                 "HFP_DIAG PKT: rx_total=%lu rx_correct=%lu rx_err=%lu rx_none=%lu rx_lost=%lu tx_total=%lu tx_discarded=%lu",
+                 (unsigned long)param->pkt_nums.rx_total,
+                 (unsigned long)param->pkt_nums.rx_correct,
+                 (unsigned long)param->pkt_nums.rx_err,
+                 (unsigned long)param->pkt_nums.rx_none,
+                 (unsigned long)param->pkt_nums.rx_lost,
+                 (unsigned long)param->pkt_nums.tx_total,
+                 (unsigned long)param->pkt_nums.tx_discarded);
+        break;
+
+    default:
+        break;
     }
 }
 
@@ -271,6 +458,29 @@ static void bt_app_mgr_task(void *arg)
 
         case BT_MGR_EVT_AUDIO_SETUP:
             if (is_connected && !audio_connect_requested) {
+                /*
+                 * Reassert the requested microphone default after the headset's
+                 * initial SLC volume reports, but before SCO audio is opened.
+                 * From this point on, incoming AT+VGM events are user changes
+                 * and are applied to the mixer immediately.
+                 */
+                audio_mixer_set_hfp_mic_gain(CONFIG_HFP_MIC_DEFAULT_GAIN);
+                esp_err_t mic_gain_ret = esp_hf_ag_volume_control(
+                    peer_bd_addr,
+                    ESP_HF_VOLUME_CONTROL_TARGET_MIC,
+                    CONFIG_HFP_MIC_DEFAULT_GAIN);
+                if (mic_gain_ret == ESP_OK) {
+                    ESP_LOGI(TAG,
+                             "HFP microphone default synchronized: VGM=%d/15",
+                             CONFIG_HFP_MIC_DEFAULT_GAIN);
+                } else {
+                    ESP_LOGW(TAG,
+                             "Failed to synchronize HFP microphone default VGM=%d: %s",
+                             CONFIG_HFP_MIC_DEFAULT_GAIN,
+                             esp_err_to_name(mic_gain_ret));
+                }
+                hfp_mic_gain_control_ready = true;
+
                 esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALL, 1);
                 esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALLSETUP, 0);
                 // Do not force a codec here. With CONFIG_BT_HFP_WBS_ENABLE=y,
@@ -916,10 +1126,17 @@ static esp_err_t bt_app_send_data(void)
         ESP_LOGI("I2S", "Initializing I2S for Louder H6 TAS5805M (32-bit stereo)...");
         i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
 
-        /* One DMA buffer = one 5 ms mixer block. Multiple descriptors absorb
-         * normal task/BT scheduling jitter without growing application FIFOs. */
-        chan_cfg.dma_frame_num = AUDIO_MIXER_BLOCK_FRAMES;
-        chan_cfg.dma_desc_num = 6;
+        /*
+         * Low-latency TAS5805M TX:
+         * 120 frames @ 48 kHz = 2.5 ms per DMA descriptor.
+         * Four descriptors provide about 10 ms total DMA buffering.
+         *
+         * The central mixer remains at 240 frames / 5 ms. One mixer write
+         * therefore spans two DMA descriptors. This reduces the previous
+         * ~30 ms TX queue without doubling mixer task wakeups.
+         */
+        chan_cfg.dma_frame_num = AUDIO_MIXER_BLOCK_FRAMES / 2U;
+        chan_cfg.dma_desc_num = 4;
 
         ret = i2s_new_channel(&chan_cfg, &tx_chan, NULL);
         if (ret != ESP_OK) {
@@ -1197,6 +1414,9 @@ const char *c_codec_mode_str[] = {
 
 void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
 {
+    /* Log every HFP control-plane callback before normal handling. */
+    bt_app_hfp_diag_log_event(event, param);
+
     switch (event) {
     case ESP_HF_CONNECTION_STATE_EVT:
         ESP_LOGI(TAG, "HFP connection state: %d", param->conn_stat.state);
@@ -1242,6 +1462,23 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
             connection_jingle_pending = true;
 
+            /*
+             * Start every new SLC at VGM 10 (or the menuconfig value). Ignore
+             * the headset's initial stored VGM report until the delayed setup
+             * reasserts this value to the peer.
+             */
+            hfp_mic_gain_control_ready = false;
+            audio_mixer_set_hfp_mic_gain(CONFIG_HFP_MIC_DEFAULT_GAIN);
+            esp_err_t initial_mic_gain_ret = esp_hf_ag_volume_control(
+                peer_bd_addr,
+                ESP_HF_VOLUME_CONTROL_TARGET_MIC,
+                CONFIG_HFP_MIC_DEFAULT_GAIN);
+            if (initial_mic_gain_ret != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "Initial HFP microphone VGM sync failed: %s",
+                         esp_err_to_name(initial_mic_gain_ret));
+            }
+
             // Trigger call setup immediately, finish setup asynchronously.
             esp_hf_ag_ciev_report(peer_bd_addr, ESP_HF_IND_TYPE_CALLSETUP, 1);
             ESP_LOGI(TAG, "Sent incoming call indicator (CALLSETUP=1)");
@@ -1270,6 +1507,8 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             negotiated_mode = ESP_HF_WBS_NONE;
             hfp_input_sample_rate = HFP_CVSD_SAMPLE_RATE;
             connection_jingle_pending = false;
+            hfp_mic_gain_control_ready = false;
+            audio_mixer_set_hfp_mic_gain(CONFIG_HFP_MIC_DEFAULT_GAIN);
 
             if (suppress_disconnect_reconnect_once) {
                 suppress_disconnect_reconnect_once = false;
@@ -1411,11 +1650,64 @@ void bt_app_hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         esp_hf_ag_cops_response(peer_bd_addr, "ESP32-Net");
         break;
         
-    case ESP_HF_VOLUME_CONTROL_EVT:
-        ESP_LOGI(TAG, "Volume control - Type: %d, Volume: %d", 
-                 param->volume_control.type, param->volume_control.volume);
-        // Volume is controlled by headset, just acknowledge
+    case ESP_HF_VOLUME_CONTROL_EVT: {
+        const int volume = param->volume_control.volume;
+
+        if (param->volume_control.type == ESP_HF_VOLUME_TYPE_MIC) {
+            /*
+             * AT+VGM is the HFP microphone gain. During SLC startup the headset
+             * may report a stored value automatically; keep AVA's configured
+             * default authoritative until audio setup has completed.
+             */
+            ESP_LOGI(TAG,
+                     "HFP HEADSET VOLUME EVENT: AT+VGM=%d/15%s",
+                     volume,
+                     hfp_mic_gain_control_ready ? " (Volume button / mic gain)" : " (startup report)");
+
+            if (!hfp_mic_gain_control_ready) {
+                ESP_LOGI(TAG,
+                         "Ignoring initial AT+VGM=%d/15; AVA microphone default remains %d/15",
+                         volume,
+                         CONFIG_HFP_MIC_DEFAULT_GAIN);
+            } else {
+                audio_mixer_set_hfp_mic_gain(volume);
+                ESP_LOGI(TAG,
+                         "HFP VOLUME BUTTON: VGM=%d/15 -> AVA microphone volume=%d/15",
+                         volume,
+                         audio_mixer_get_hfp_mic_gain());
+            }
+        } else if (param->volume_control.type == ESP_HF_VOLUME_TYPE_SPK) {
+            /*
+             * Some headsets expose their physical Volume +/- buttons as VGS
+             * (speaker gain), even though AVA uses the headset primarily as a
+             * microphone source. Map VGS to the same microphone mixer gain so
+             * those buttons can control the AVA microphone volume as requested.
+             */
+            ESP_LOGI(TAG,
+                     "HFP HEADSET VOLUME EVENT: AT+VGS=%d/15%s",
+                     volume,
+                     hfp_mic_gain_control_ready ? " (Volume button / speaker gain)" : " (startup report)");
+
+            if (!hfp_mic_gain_control_ready) {
+                ESP_LOGI(TAG,
+                         "Ignoring initial AT+VGS=%d/15; AVA microphone default remains %d/15",
+                         volume,
+                         CONFIG_HFP_MIC_DEFAULT_GAIN);
+            } else {
+                audio_mixer_set_hfp_mic_gain(volume);
+                ESP_LOGI(TAG,
+                         "HFP VOLUME BUTTON: VGS=%d/15 -> AVA microphone volume=%d/15",
+                         volume,
+                         audio_mixer_get_hfp_mic_gain());
+            }
+        } else {
+            ESP_LOGW(TAG,
+                     "Unknown HFP volume target=%d volume=%d/15",
+                     (int)param->volume_control.type,
+                     volume);
+        }
         break;
+    }
         
     case ESP_HF_BVRA_RESPONSE_EVT:
         ESP_LOGI(TAG, "Voice recognition response");
